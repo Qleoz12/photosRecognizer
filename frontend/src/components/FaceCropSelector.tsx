@@ -2,7 +2,7 @@
  * Overlay on an image to select a face region (rectangle).
  * Emits normalized bbox [x1,y1,x2,y2] 0-1 on complete.
  */
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useEffect } from "react";
 
 interface Props {
   imageUrl: string;
@@ -19,6 +19,24 @@ export default function FaceCropSelector({ imageUrl, onComplete, onCancel, searc
   const [start, setStart] = useState<{ x: number; y: number } | null>(null);
   const [current, setCurrent] = useState<{ x: number; y: number } | null>(null);
   const [imgLoaded, setImgLoaded] = useState(false);
+  const isDraggingRef = useRef(false);
+
+  // Capturar mouseup global para que el release fuera del área no cierre nada
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      if (isDraggingRef.current && start && current) {
+        const w = Math.abs(current.x - start.x);
+        const h = Math.abs(current.y - start.y);
+        if (w < MIN_SEL && h < MIN_SEL) {
+          setStart(null);
+          setCurrent(null);
+        }
+        isDraggingRef.current = false;
+      }
+    };
+    document.addEventListener("mouseup", handleGlobalMouseUp);
+    return () => document.removeEventListener("mouseup", handleGlobalMouseUp);
+  }, [start, current]);
 
   const getNormBbox = useCallback(() => {
     const img = imgRef.current;
@@ -60,8 +78,10 @@ export default function FaceCropSelector({ imageUrl, onComplete, onCancel, searc
 
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
+    isDraggingRef.current = true;
     setStart({ x: e.clientX - rect.left, y: e.clientY - rect.top });
     setCurrent({ x: e.clientX - rect.left, y: e.clientY - rect.top });
   };
@@ -73,11 +93,16 @@ export default function FaceCropSelector({ imageUrl, onComplete, onCancel, searc
     setCurrent({ x: e.clientX - rect.left, y: e.clientY - rect.top });
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.MouseEvent) => {
+    e.stopPropagation();
     if (start && current) {
       const w = Math.abs(current.x - start.x);
       const h = Math.abs(current.y - start.y);
-      if (w < MIN_SEL && h < MIN_SEL) setStart(null), setCurrent(null);
+      if (w < MIN_SEL && h < MIN_SEL) {
+        setStart(null);
+        setCurrent(null);
+      }
+      isDraggingRef.current = false;
     }
   };
 
@@ -110,7 +135,7 @@ export default function FaceCropSelector({ imageUrl, onComplete, onCancel, searc
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={() => start && !current && setStart(null)}
+        onMouseLeave={() => {}}
       >
         <img
           ref={imgRef}

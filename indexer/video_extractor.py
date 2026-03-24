@@ -35,6 +35,39 @@ def get_video_duration(video_path: Path) -> float | None:
         return None
 
 
+def get_video_metadata(video_path: Path) -> dict:
+    """Return duration (s), width, height from ffprobe. Returns empty dict on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_format", "-show_streams",
+                "-select_streams", "v:0",
+                "-of", "json",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+        import json
+        data = json.loads(result.stdout)
+        out = {}
+        if "format" in data and "duration" in data["format"]:
+            out["duration"] = float(data["format"]["duration"])
+        if "streams" in data and len(data["streams"]) > 0:
+            s = data["streams"][0]
+            if "width" in s:
+                out["width"] = int(s["width"])
+            if "height" in s:
+                out["height"] = int(s["height"])
+        return out
+    except Exception:
+        return {}
+
+
 def extract_frames(
     video_path: Path,
     max_frames: int = MAX_FRAMES,

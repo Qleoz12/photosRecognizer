@@ -5,6 +5,7 @@ import FaceCropSelector from "../components/FaceCropSelector";
 import PhotoCard from "../components/PhotoCard";
 import PersonCard from "../components/PersonCard";
 import Spinner from "../components/Spinner";
+import { useInfiniteScroll } from "../hooks/useInfiniteScroll";
 
 const PAGE_SIZE = 100;
 
@@ -29,7 +30,7 @@ export default function PersonDetail() {
   const [cropResults, setCropResults] = useState<{
     faces: Array<{ bbox: number[]; det_score: number; suggestions: SearchResult[]; embedding_b64?: string }>;
   } | null>(null);
-  const [cropBbox, setCropBbox] = useState<[number, number, number, number] | null>(null);
+  const [, setCropBbox] = useState<[number, number, number, number] | null>(null);
   const [cropSearching, setCropSearching] = useState(false);
   const [addingFace, setAddingFace] = useState<{ faceIdx: number; clusterId: number } | null>(null);
   const [allPeople, setAllPeople] = useState<ClusterOut[]>([]);
@@ -55,6 +56,11 @@ export default function PersonDetail() {
     exif_datetime_digitized: string | null;
     exif_image_datetime: string | null;
   } | null>(null);
+  const [similarModalOpen, setSimilarModalOpen] = useState(false);
+  const [similarResults, setSimilarResults] = useState<{ file_id: number; similarity: number }[]>([]);
+  const [findingSimilar, setFindingSimilar] = useState(false);
+  const [similarPoolCount, setSimilarPoolCount] = useState(0);
+  const [similarFiles, setSimilarFiles] = useState<Record<number, FileOut>>({});
 
   useEffect(() => {
     Promise.all([
@@ -144,11 +150,75 @@ export default function PersonDetail() {
     }
   }, [personId, files.length, loadingMore, hasMore]);
 
+  const loadMoreSentinelRef = useInfiniteScroll(loadMore, loadingMore, hasMore);
+
   const handleRename = async () => {
     if (!person) return;
     const updated = await api.renamePerson(person.id, newLabel);
     setPerson(updated);
     setEditing(false);
+  };
+
+  const personFileIds = new Set(files.map((f) => f.id));
+
+  const handleFindSimilarHere = async () => {
+    setSimilarModalOpen(true);
+    setFindingSimilar(true);
+    setSimilarResults([]);
+    setSimilarPoolCount(0);
+    setSimilarFiles({});
+    try {
+      const pool: number[] = [];
+      const poolFiles: Record<number, FileOut> = {};
+      const BATCH = 1000;
+      const MAX = 5000;
+      for (let skip = 0; skip < MAX; skip += BATCH) {
+        const batch = await api.getPhotos(skip, BATCH, "photo");
+        if (batch.length === 0) break;
+        for (const f of batch) {
+          if (!personFileIds.has(f.id)) {
+            pool.push(f.id);
+            poolFiles[f.id] = f;
+          }
+        }
+        setSimilarPoolCount(pool.length);
+        if (batch.length < BATCH) break;
+      }
+      const results = await api.findSimilarPersonInPage(personId, pool);
+      setSimilarResults(results);
+      const byId: Record<number, FileOut> = {};
+      for (const r of results) {
+        if (poolFiles[r.file_id]) byId[r.file_id] = poolFiles[r.file_id];
+        else {
+          try {
+            const f = await api.getPhoto(r.file_id);
+            byId[r.file_id] = f;
+          } catch {
+            /* ignorar */
+          }
+        }
+      }
+      setSimilarFiles(byId);
+    } catch (e) {
+      alert("Error: " + e);
+    } finally {
+      setFindingSimilar(false);
+    }
+  };
+
+  const handleAddSimilarToPerson = async (fileId: number) => {
+    try {
+      await api.addFaceToPerson(personId, fileId, [0, 0, 1, 1]);
+      setSimilarResults((prev) => prev.filter((r) => r.file_id !== fileId));
+      const [updated, newFiles] = await Promise.all([
+        api.getPerson(personId),
+        api.getPersonPhotos(personId, 0, Math.max(files.length, PAGE_SIZE)),
+      ]);
+      setPerson(updated);
+      setFiles(newFiles);
+    } catch (e) {
+      alert("Error: " + e);
+    }
   };
 
   const handleMerge = async (sourceId: number) => {
@@ -511,6 +581,19 @@ export default function PersonDetail() {
             {" · "}mostrando {files.length.toLocaleString()}
             {videos.length > 0 && ` · ${videos.length} video${videos.length !== 1 ? "s" : ""}`}
           </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleFindSimilarHere}
+              disabled={findingSimilar}
+              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium"
+            >
+              {findingSimilar ? "Buscando..." : "Buscar similares aquí"}
+            </button>
+            <span className="text-xs text-gray-500 self-center max-w-md">
+              Busca entre las primeras ~10 000 fotos. Las sugerencias aparecen aquí (no te envía a la galería).
+            </span>
+          </div>
         </div>
       </div>
 
@@ -612,6 +695,64 @@ export default function PersonDetail() {
         </div>
       )}
 
+      {similarModalOpen && (
+        <div
+          className="fixed inset-0 bg-black/90 z-50 flex flex-col p-6 overflow-hidden"
+          onClick={() => setSimilarModalOpen(false)}
+        >
+          <div
+            className="bg-gray-900 rounded-xl max-w-6xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-4 border-b border-gray-700 flex items-center justify-between shrink-0">
+              <h2 className="text-lg font-semibold text-white">
+                Similares a la persona — busca en {similarPoolCount.toLocaleString()} fotos cargadas
+              </h2>
+              <button
+                onClick={() => setSimilarModalOpen(false)}
+                className="text-gray-400 hover:text-white text-2xl"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-4 overflow-auto flex-1">
+              {findingSimilar ? (
+                <div className="flex flex-col items-center justify-center py-16 text-gray-400">
+                  <Spinner message={`Cargando pool (${similarPoolCount.toLocaleString()} fotos) y buscando...`} />
+                </div>
+              ) : similarResults.length === 0 ? (
+                <div className="text-center py-16 text-gray-400">
+                  {similarPoolCount > 0 ? "No se encontraron fotos con esta persona." : "Sin resultados."}
+                </div>
+              ) : (
+                <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-2">
+                  {similarResults.map((r) => {
+                    const f = similarFiles[r.file_id];
+                    if (!f) return null;
+                    return (
+                      <div key={r.file_id} className="relative group">
+                        <PhotoCard file={f} onClick={() => setLightbox(f)} />
+                        <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-black/60 rounded-lg transition-opacity">
+                          <button
+                            onClick={() => handleAddSimilarToPerson(r.file_id)}
+                            className="px-2 py-1 rounded text-white text-xs bg-blue-600 hover:bg-blue-500"
+                          >
+                            + Persona
+                          </button>
+                        </div>
+                        <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5">
+                          {Math.round(r.similarity * 100)}%
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Personas similares — ordenadas por parecido para validar merges */}
       {similar.length > 0 && (
         <div className="mb-10">
@@ -675,15 +816,15 @@ export default function PersonDetail() {
         </div>
       ))}
 
-      {/* Load more */}
+      {/* Load more — auto-dispara al hacer scroll cuando el botón entra en vista */}
       {hasMore && (
-        <div className="flex justify-center mt-4 mb-10">
+        <div ref={loadMoreSentinelRef} className="flex justify-center mt-4 mb-10 min-h-[60px]">
           <button
             onClick={loadMore}
             disabled={loadingMore}
             className="px-6 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-50 transition-colors"
           >
-            {loadingMore ? "Cargando..." : `Cargar más fotos (${(person.size - files.length).toLocaleString()} restantes)`}
+            {loadingMore ? "Cargando..." : `Cargar más fotos (${(person?.size ?? 0) - files.length} restantes)`}
           </button>
         </div>
       )}
@@ -721,6 +862,8 @@ export default function PersonDetail() {
               <video
                 src={api.originalUrl(lightbox.id)}
                 controls
+                controlsList="nodownload"
+                preload="auto"
                 autoPlay
                 className="max-w-full max-h-[80vh] rounded-lg bg-black"
               />
@@ -781,8 +924,9 @@ export default function PersonDetail() {
                   La foto aparecerá en la galería de quien elijas. Si ya tiene rostros de otras personas, seguirá en sus galerías también.
                 </p>
                 {cropResults.faces.map((face, faceIdx) => {
+                  const MIN_SIMILARITY = 0.35; // Filtrar ruido (ej. perro vs personas)
                   const suggestions = face.suggestions
-                    .filter((r) => r.cluster_id != null)
+                    .filter((r) => r.cluster_id != null && r.similarity >= MIN_SIMILARITY)
                     .reduce((acc: SearchResult[], r) => {
                       if (!acc.some((x) => x.cluster_id === r.cluster_id)) acc.push(r);
                       return acc;

@@ -40,6 +40,33 @@ def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
         return f"fast:{size}:{mtime:.3f}"
 
 
+def compute_content_hash(path: Path, chunk_size: int = 1 << 20) -> str | None:
+    """
+    Content-based hash that survives copy/move (mtime changes).
+    For files <= 50MB: full SHA256 (same as compute_hash).
+    For larger files: hash of first 64KB + last 64KB + size (fast, survives move).
+    Returns None on read error.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+
+    if size <= _HASH_SIZE_LIMIT:
+        return compute_hash(path, chunk_size)
+
+    # Large files: partial content hash
+    sample = 64 * 1024  # 64 KB
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(sample))
+        if size > 2 * sample:
+            f.seek(size - sample)
+            h.update(f.read(sample))
+        h.update(str(size).encode())
+    return f"content:{h.hexdigest()}"
+
+
 def get_file_type(path: Path) -> str | None:
     ext = path.suffix.lower()
     if ext in PHOTO_EXTENSIONS:

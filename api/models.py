@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 class FaceOut(BaseModel):
     id: int
+    file_id: Optional[int] = None  # file this face belongs to
     bbox: List[float]
     det_score: Optional[float]
     cluster_id: Optional[int]
@@ -33,6 +34,7 @@ class FileOut(BaseModel):
     thumbnail_path: Optional[str]
     width: Optional[int]
     height: Optional[int]
+    duration: Optional[float] = None  # seconds, for videos
     faces: List[FaceOut] = []
 
     class Config:

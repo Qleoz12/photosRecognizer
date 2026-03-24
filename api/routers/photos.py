@@ -2,11 +2,13 @@
 /photos  — file-centric endpoints
 """
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from api.deps import get_session
 from api.models import FileOut, FaceOut, FileUpdateIn
@@ -19,6 +21,7 @@ def _file_to_out(f: File) -> FileOut:
     faces_out = [
         FaceOut(
             id=face.id,
+            file_id=face.file_id,
             bbox=json.loads(face.bbox_json),
             det_score=face.det_score,
             cluster_id=face.cluster_id,
@@ -43,6 +46,7 @@ def _file_to_out(f: File) -> FileOut:
         thumbnail_path=f.thumbnail_path,
         width=f.width,
         height=f.height,
+        duration=getattr(f, "duration", None),
         faces=faces_out,
     )
 
@@ -56,16 +60,38 @@ def list_photos(
     date_to: Optional[datetime] = None,
     session: Session = Depends(get_session),
 ):
-    q = session.query(File)
+    q = session.query(File).options(joinedload(File.faces))
     if file_type:
         q = q.filter(File.file_type == file_type)
     if date_from:
         q = q.filter(File.exif_date >= date_from)
     if date_to:
         q = q.filter(File.exif_date <= date_to)
-    q = q.order_by(File.exif_date.desc().nullslast())
+    q = q.order_by(File.exif_date.desc().nullsfirst(), File.mtime.desc().nullslast())
     files = q.offset(skip).limit(limit).all()
     return [_file_to_out(f) for f in files]
+
+
+@router.get("/file-extensions")
+def get_file_extensions(session: Session = Depends(get_session)):
+    """
+    Lista extensiones de archivo en la biblioteca con un ejemplo por tipo.
+    Para probar visualización de cada extensión (.jpg, .png, .heic, etc.).
+    """
+    rows = session.query(File.id, File.path, File.file_type).all()
+    by_ext: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for fid, path, ftype in rows:
+        ext = (Path(path).suffix or "").lower() or "(sin extensión)"
+        by_ext[ext].append((fid, ftype))
+    return [
+        {
+            "extension": ext,
+            "count": len(items),
+            "example_file_id": items[0][0],
+            "file_type": items[0][1],
+        }
+        for ext, items in sorted(by_ext.items(), key=lambda x: -len(x[1]))
+    ]
 
 
 @router.get("/{photo_id}", response_model=FileOut)

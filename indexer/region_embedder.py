@@ -1,10 +1,11 @@
 """
 CLIP-based embedding for image regions (crops) when no human face is detected.
-Used for pets, objects, etc. — same 512-dim space as face embeddings for HNSW compatibility.
+Used for pets, objects, documents, etc.
 """
 from __future__ import annotations
 
 import numpy as np
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -42,3 +43,16 @@ def embed_region(crop: "Image.Image") -> np.ndarray:
         emb = model.encode_image(img_tensor)
         emb = emb / emb.norm(dim=-1, keepdim=True)
     return emb.squeeze(0).float().numpy().astype(np.float32)
+
+
+def embed_full_image(path: Path) -> np.ndarray | None:
+    """
+    Extract 512-dim CLIP embedding from a full image file.
+    For álbums/recuerdos de documentos (sin caras): similitud visual por CLIP.
+    """
+    from PIL import Image
+    try:
+        img = Image.open(path).convert("RGB")
+    except Exception:
+        return None
+    return embed_region(img)

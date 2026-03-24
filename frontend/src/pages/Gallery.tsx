@@ -175,7 +175,7 @@ export default function Gallery() {
           >
             <h2 className="text-lg font-semibold text-white mb-3">Crear persona</h2>
             <p className="text-sm text-gray-400 mb-4">
-              Crea una persona vacía (ej. Perro, Tema). Luego en All Photos podrás asignar fotos con &quot;Cotejar contra rostros&quot;.
+              Crea una persona vacía (ej. Perro, Tema). Luego en All Photos podrás asignar fotos con &quot;Seleccionar persona en foto&quot;.
             </p>
             <input
               type="text"

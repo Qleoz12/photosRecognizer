@@ -4,16 +4,38 @@ Serves the API and optionally the React frontend static files.
 """
 import logging
 import os
+import sys
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+# Carpeta logs en la raíz del proyecto
+LOGS_DIR = Path(__file__).parent.parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+API_LOG = LOGS_DIR / "api.log"
 
-from fastapi import FastAPI
+# Formato detallado para archivo (con timestamp)
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Configurar logging: consola + archivo
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+# Añadir handler para archivo (errores y operaciones)
+root_logger = logging.getLogger()
+file_handler = logging.FileHandler(API_LOG, encoding="utf-8")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+root_logger.addHandler(file_handler)
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api.routers import people, photos, search
+from api.routers import people, photos, search, memories, albums
 
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 THUMBNAILS_DIR = Path(__file__).parent.parent / "data" / "thumbnails"
@@ -23,6 +45,37 @@ app = FastAPI(
     description="Local face recognition photo search",
     version="1.0.0",
 )
+
+log = logging.getLogger("photos_recognizer.api")
+
+
+@app.exception_handler(Exception)
+def log_unhandled_exceptions(request, exc):
+    """Registra errores no capturados en logs/api.log"""
+    log.exception("Unhandled error: %s %s - %s", request.method, request.url.path, exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """Registra cada petición en logs/api.log"""
+    import time
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = (time.perf_counter() - start) * 1000
+    log.info("%s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed)
+    return response
+
+
+@app.middleware("http")
+async def cache_thumbnails(request, call_next):
+    """Cache-Control para thumbnails: 24h en navegador"""
+    response = await call_next(request)
+    if request.url.path.startswith("/thumbnails/"):
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +88,8 @@ app.add_middleware(
 app.include_router(people.router)
 app.include_router(photos.router)
 app.include_router(search.router)
+app.include_router(memories.router)
+app.include_router(albums.router)
 
 # Serve thumbnails as static files
 THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,7 +131,7 @@ def serve_face_crop(file_id: int, bbox: str):
         img = Image.open(str(fpath))
         img.load()
         img = ImageOps.exif_transpose(img)
-        if img.mode in ("RGBA", "P", "LA"):
+        if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         w, h = img.size
         px1 = int(x1 * w)
@@ -98,12 +153,12 @@ def serve_face_crop(file_id: int, bbox: str):
 # Serve cropped face by face_id (uses face's file + bbox)
 @app.get("/faces/{face_id}/crop")
 def serve_face_crop_by_id(face_id: int):
-    """Serve cropped thumbnail for a face. Works for photos; videos may fall back to full thumbnail."""
+    """Serve cropped thumbnail for a face. Photos: crop from image. Videos: serve full frame thumbnail (no timestamp stored)."""
     from api.deps import get_engine_cached
     from sqlalchemy.orm import Session
     from indexer.db import File, Face
     from fastapi import HTTPException
-    from fastapi.responses import Response
+    from fastapi.responses import Response, FileResponse
     from PIL import Image, ImageOps
     import json
     import io
@@ -115,8 +170,15 @@ def serve_face_crop_by_id(face_id: int):
         f = face.file
         if not f or not Path(f.path).exists():
             raise HTTPException(404, "File not found")
-        if f.file_type != "photo":
-            raise HTTPException(400, "Face crop only supported for photos")
+        if f.file_type == "video":
+            # Videos: serve thumbnail (we don't store frame timestamp for face crop)
+            if f.thumbnail_path and Path(f.thumbnail_path).exists():
+                return FileResponse(
+                    f.thumbnail_path,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+                )
+            raise HTTPException(404, "Video thumbnail not found")
         fpath = Path(f.path)
         bbox_px = json.loads(face.bbox_json)
         if len(bbox_px) != 4:
@@ -126,7 +188,7 @@ def serve_face_crop_by_id(face_id: int):
         img = Image.open(str(fpath))
         img.load()
         img = ImageOps.exif_transpose(img)
-        if img.mode in ("RGBA", "P", "LA"):
+        if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         w, h = img.size
         x1, y1, x2, y2 = bbox_px[0], bbox_px[1], bbox_px[2], bbox_px[3]
@@ -150,10 +212,11 @@ def serve_face_crop_by_id(face_id: int):
 
 # Serve original photos with EXIF orientation corrected
 @app.get("/originals/{file_id}")
-def serve_original(file_id: int):
+def serve_original(file_id: int, request: Request):
     from api.deps import get_engine_cached
     from sqlalchemy.orm import Session
     from indexer.db import File
+    from api.video_stream import stream_video_file
     from fastapi import HTTPException
     from fastapi.responses import Response
     import io
@@ -166,9 +229,9 @@ def serve_original(file_id: int):
         fpath = Path(f.path)
         suffix = fpath.suffix.lower()
 
-        # Videos and non-image files: serve raw
+        # Vídeos: Range requests (206) para poder adelantar en el reproductor
         if suffix in {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".wmv"}:
-            return FileResponse(str(fpath))
+            return stream_video_file(fpath, request)
 
         # Images: apply EXIF orientation before sending
         try:
@@ -176,7 +239,8 @@ def serve_original(file_id: int):
             img = Image.open(str(fpath))
             img.load()
             img = ImageOps.exif_transpose(img)
-            if img.mode in ("RGBA", "P", "LA"):
+            # CMYK y otros modos no-RGB se ven negros en navegadores; convertir a RGB
+            if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=92)

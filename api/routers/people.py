@@ -9,15 +9,17 @@ from typing import List, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from sqlalchemy.orm import Session, joinedload
 
 from pathlib import Path
 
 from api.deps import get_session
 from api.models import ClusterOut, ClusterSimilarOut, FileOut, ClusterUpdateIn, MergeClustersIn, CreateClusterIn, AddFaceIn, AssignFaceIn, FaceOut, SetFaceCanonicalIn
-from indexer.db import Cluster, Face, File, embedding_to_bytes
+from indexer.db import Cluster, Face, File, bytes_to_embedding, embedding_to_bytes
 from indexer.embeddings_store import get_cluster_centroids
 from indexer.face_detector import load_image, detect_faces
+from indexer.region_embedder import embed_region
 
 router = APIRouter(prefix="/people", tags=["people"])
 
@@ -118,6 +120,80 @@ def get_similar_people(
     return out
 
 
+class FindSimilarPageIn(BaseModel):
+    """Solo file_ids que el cliente tiene cargados en la página (p. ej. All Photos)."""
+    file_ids: List[int]
+
+
+class SimilarFileInPage(BaseModel):
+    file_id: int
+    similarity: float
+
+
+@router.post("/{person_id}/find-similar-in-page", response_model=List[SimilarFileInPage])
+def find_similar_person_in_loaded_page(
+    person_id: int,
+    body: FindSimilarPageIn,
+    min_similarity: float = Query(0.35, ge=0.0, le=1.0),
+    session: Session = Depends(get_session),
+):
+    """
+    Fotos similares a esta persona entre los file_ids enviados (solo lo cargado en el navegador).
+    No recorre toda la biblioteca.
+    """
+    cluster = session.get(Cluster, person_id)
+    if not cluster:
+        raise HTTPException(404, "Person not found")
+
+    face_rows = (
+        session.query(Face)
+        .filter(Face.cluster_id == person_id)
+        .filter(Face.is_canonical == 1)
+        .all()
+    )
+    if not face_rows:
+        face_rows = session.query(Face).filter(Face.cluster_id == person_id).all()
+    if not face_rows:
+        return []
+
+    embs = [bytes_to_embedding(f.embedding) for f in face_rows]
+    centroid = np.stack(embs).mean(axis=0).astype(np.float32)
+    centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+
+    already_person = {
+        row[0]
+        for row in session.query(Face.file_id)
+        .filter(Face.cluster_id == person_id)
+        .distinct()
+        .all()
+    }
+
+    results: List[SimilarFileInPage] = []
+    seen: set[int] = set()
+    for fid in body.file_ids:
+        if fid in seen or fid in already_person:
+            continue
+        f = session.get(File, fid)
+        if not f or f.file_type != "photo":
+            continue
+        faces = session.query(Face).filter_by(file_id=fid).all()
+        if not faces:
+            continue
+        best_sim = -1.0
+        for face in faces:
+            emb = bytes_to_embedding(face.embedding)
+            emb = emb / (np.linalg.norm(emb) + 1e-9)
+            sim = float(np.dot(centroid, emb))
+            if sim > best_sim:
+                best_sim = sim
+        if best_sim >= min_similarity:
+            results.append(SimilarFileInPage(file_id=fid, similarity=round(best_sim, 4)))
+            seen.add(fid)
+
+    results.sort(key=lambda x: x.similarity, reverse=True)
+    return results[:50]
+
+
 @router.get("/{person_id}/photos", response_model=List[FileOut])
 def get_person_photos(
     person_id: int,
@@ -133,6 +209,7 @@ def get_person_photos(
     # JOIN ensures we get files that have at least one face in this cluster
     files = (
         session.query(File)
+        .options(joinedload(File.faces))
         .join(Face, Face.file_id == File.id)
         .filter(Face.cluster_id == person_id)
         .distinct()
@@ -147,6 +224,7 @@ def get_person_photos(
         faces_out = [
             FaceOut(
                 id=face.id,
+                file_id=face.file_id,
                 bbox=json.loads(face.bbox_json),
                 det_score=face.det_score,
                 cluster_id=face.cluster_id,
@@ -171,6 +249,7 @@ def get_person_photos(
             thumbnail_path=f.thumbnail_path,
             width=f.width,
             height=f.height,
+            duration=getattr(f, "duration", None),
             faces=faces_out,
         ))
     return result
@@ -313,17 +392,26 @@ def add_face_to_person(
         crop = img.crop((cx1, cy1, cx2, cy2))
         faces = detect_faces(crop)
         log.info("add-face: detect crop=%sx%s, faces=%s", crop.width, crop.height, len(faces) if faces else 0)
-        if not faces:
-            raise HTTPException(422, "No face detected in selected region")
-        best = max(faces, key=lambda x: x[2])
-        face_bbox = best[0]
-        bbox_px = [
-            float(cx1 + face_bbox[0]),
-            float(cy1 + face_bbox[1]),
-            float(cx1 + face_bbox[2]),
-            float(cy1 + face_bbox[3]),
-        ]
-        embedding, det_score = best[1], best[2]
+        if faces:
+            best = max(faces, key=lambda x: x[2])
+            face_bbox = best[0]
+            bbox_px = [
+                float(cx1 + face_bbox[0]),
+                float(cy1 + face_bbox[1]),
+                float(cx1 + face_bbox[2]),
+                float(cy1 + face_bbox[3]),
+            ]
+            embedding, det_score = best[1], best[2]
+        else:
+            # Fallback: CLIP para mascotas/objetos o asignación manual
+            try:
+                embedding = embed_region(crop)
+                det_score = 0.5
+                bbox_px = [float(x1), float(y1), float(x2), float(y2)]
+                log.info("add-face: using CLIP fallback for region, person=%s file=%s", person_id, body.file_id)
+            except Exception as e:
+                log.warning("add-face: CLIP fallback failed: %s", e)
+                raise HTTPException(422, "No se pudo procesar la región seleccionada")
 
     face = Face(
         file_id=body.file_id,
@@ -334,6 +422,34 @@ def add_face_to_person(
     )
     session.add(face)
     session.flush()
+    cluster.size = session.query(Face).filter(Face.cluster_id == person_id).count()
+    if cluster.cover_face_id is None:
+        cluster.cover_face_id = face.id
+    session.commit()
+    return _cluster_to_out(cluster, session)
+
+
+@router.post("/{person_id}/add-video", response_model=ClusterOut)
+def add_video_to_person(
+    person_id: int,
+    file_id: int = Query(..., description="Video file ID"),
+    session: Session = Depends(get_session),
+):
+    """Asigna un video a una persona usando el primer rostro detectado en el video."""
+    cluster = session.get(Cluster, person_id)
+    if not cluster:
+        raise HTTPException(404, "Person not found")
+    f = session.get(File, file_id)
+    if not f or not Path(f.path).exists():
+        raise HTTPException(404, "File not found")
+    if f.file_type != "video":
+        raise HTTPException(400, "Solo videos soportados")
+
+    face = session.query(Face).filter(Face.file_id == file_id).first()
+    if not face:
+        raise HTTPException(400, "El video no tiene rostros detectados. Reindexa el video.")
+
+    face.cluster_id = person_id
     cluster.size = session.query(Face).filter(Face.cluster_id == person_id).count()
     if cluster.cover_face_id is None:
         cluster.cover_face_id = face.id

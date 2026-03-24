@@ -17,9 +17,9 @@ del /F /Q "data\photos.db-shm" >nul 2>&1
 
 echo Indexando desde cero...
 if "%1"=="" (
-    python -m indexer.run
+    python -m indexer.run --force
 ) else (
-    python -m indexer.run --root "%1"
+    python -m indexer.run --root "%1" --force
 )
 
 echo.

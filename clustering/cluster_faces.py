@@ -9,12 +9,18 @@ Usage:
 """
 import argparse
 import sys
+from datetime import datetime
 from typing import List
+
+
+def _log(msg: str, file=sys.stdout) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", file=file, flush=True)
 
 import numpy as np
 from sqlalchemy.orm import Session
 
-from indexer.db import get_engine, Face, Cluster
+from indexer.db import get_engine, Face, Cluster, File
 from indexer.embeddings_store import (
     update_face_cluster,
     create_or_update_cluster,
@@ -30,7 +36,7 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
             c.id for c in session.query(Cluster).filter(Cluster.is_manual == 1).all()
         }
         if manual_cluster_ids:
-            print(f"Preserving {len(manual_cluster_ids)} manual cluster(s) from UI merges/renames.")
+            _log(f"Preserving {len(manual_cluster_ids)} manual cluster(s) from UI merges/renames.")
 
         # Only auto-cluster faces NOT already in a manual cluster
         all_faces = session.query(Face).all()
@@ -59,17 +65,17 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
         session.flush()
 
     if not face_ids:
-        print("No free faces to cluster (all are in manual clusters).")
+        _log("No free faces to cluster (all are in manual clusters).")
         return
 
     embeddings = np.stack(embeddings_list)
-    print(f"Clustering {len(face_ids)} face embeddings with {algorithm.upper()}...")
+    _log(f"Clustering {len(face_ids)} face embeddings with {algorithm.upper()}...")
 
     labels = _run_clustering(embeddings, algorithm, eps, min_samples)
 
     noise_count = int((labels == -1).sum())
     cluster_count = len(set(labels) - {-1})
-    print(f"Found {cluster_count} clusters, {noise_count} noise faces.")
+    _log(f"Found {cluster_count} clusters, {noise_count} noise faces.")
 
     # Promote high-quality lone faces to solo clusters
     labels = labels.copy()
@@ -82,7 +88,7 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
     kept_noise = int((labels == -1).sum())
     solo = next_id - cluster_count
     if solo:
-        print(f"Added {solo} solo clusters for high-quality lone faces. {kept_noise} low-quality faces remain as noise.")
+        _log(f"Added {solo} solo clusters for high-quality lone faces. {kept_noise} low-quality faces remain as noise.")
 
     # Offset auto cluster IDs to avoid collisions with any existing manual IDs
     with Session(engine) as session:
@@ -100,11 +106,21 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
                 cluster_sizes.setdefault(real_id, []).append(face_id)
 
         for cluster_id, fids in cluster_sizes.items():
+            # Prefer photo faces over video faces for cover (better crop support)
+            def _is_photo(fid):
+                face = session.get(Face, fid)
+                if not face:
+                    return False
+                f = session.get(File, face.file_id)
+                return f and f.file_type == "photo"
+
+            sorted_fids = sorted(fids, key=lambda fid: (0 if _is_photo(fid) else 1))
+            cover = sorted_fids[0] if sorted_fids else None
             create_or_update_cluster(
                 session,
                 cluster_id=cluster_id,
                 size=len(fids),
-                cover_face_id=fids[0],
+                cover_face_id=cover,
             )
 
         # Update sizes of manual clusters (faces may have been added by new indexing)
@@ -116,7 +132,7 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
         session.commit()
 
     total_auto = len(cluster_sizes)
-    print(f"Clustering saved. Auto groups: {total_auto}, Manual groups preserved: {len(manual_cluster_ids)}")
+    _log(f"Clustering saved. Auto groups: {total_auto}, Manual groups preserved: {len(manual_cluster_ids)}")
 
 
 def _run_clustering(embeddings: np.ndarray, algorithm: str, eps: float, min_samples: int) -> np.ndarray:
@@ -135,7 +151,7 @@ def _run_clustering(embeddings: np.ndarray, algorithm: str, eps: float, min_samp
             )
             return clusterer.fit_predict(normed)
         except ImportError:
-            print("hdbscan not available, falling back to DBSCAN.", file=sys.stderr)
+            _log("hdbscan not available, falling back to DBSCAN.", file=sys.stderr)
 
     from sklearn.cluster import DBSCAN
     clusterer = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine", n_jobs=-1)

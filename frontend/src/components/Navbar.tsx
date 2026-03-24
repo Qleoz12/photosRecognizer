@@ -6,6 +6,10 @@ export default function Navbar() {
   const links = [
     { to: "/", label: "People" },
     { to: "/gallery", label: "All Photos" },
+    { to: "/videos", label: "Videos" },
+    { to: "/recuerdos", label: "Recuerdos" },
+    { to: "/albums", label: "Álbumes" },
+    { to: "/file-types", label: "Tipos de archivo" },
     { to: "/search", label: "Search by Face" },
     { to: "/clusters", label: "Manage Clusters" },
   ];

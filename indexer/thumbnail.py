@@ -31,7 +31,7 @@ def make_thumbnail(image, file_path: Path) -> Optional[str]:
         # Preserve aspect ratio — fit within THUMB_MAX x THUMB_MAX box
         img.thumbnail((THUMB_MAX, THUMB_MAX))
 
-        if img.mode in ("RGBA", "P", "LA"):
+        if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
 
         img.save(thumb_path, "JPEG", quality=85)

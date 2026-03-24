@@ -25,6 +25,8 @@ def upsert_file(
     thumbnail_path: Optional[str] = None,
     width: Optional[int] = None,
     height: Optional[int] = None,
+    duration: Optional[float] = None,
+    content_hash: Optional[str] = None,
 ) -> File:
     """Insert or update a file record. Returns the File ORM object."""
     existing = session.query(File).filter_by(path=path).first()
@@ -38,12 +40,17 @@ def upsert_file(
         existing.thumbnail_path = thumbnail_path
         existing.width = width
         existing.height = height
+        if duration is not None:
+            existing.duration = duration
+        if content_hash is not None:
+            existing.content_hash = content_hash
         session.flush()
         return existing
 
     file_obj = File(
         path=path,
         file_hash=file_hash,
+        content_hash=content_hash,
         mtime=mtime,
         file_type=file_type,
         exif_date=exif_date,
@@ -52,10 +59,36 @@ def upsert_file(
         thumbnail_path=thumbnail_path,
         width=width,
         height=height,
+        duration=duration,
     )
     session.add(file_obj)
     session.flush()
     return file_obj
+
+
+def find_by_content_hash(session: Session, content_hash: str, file_type: str) -> Optional[File]:
+    """Find file by content_hash and file_type. Used to skip re-processing when file was moved."""
+    return session.query(File).filter(
+        File.content_hash == content_hash,
+        File.file_type == file_type,
+    ).first()
+
+
+def find_by_file_hash(session: Session, file_hash: str, file_type: str) -> Optional[File]:
+    """Find file by file_hash (content-based for small files). Fallback for records without content_hash."""
+    return session.query(File).filter(
+        File.file_hash == file_hash,
+        File.file_type == file_type,
+    ).first()
+
+
+def update_file_path(session: Session, file_id: int, new_path: str, new_mtime: float):
+    """Update path and mtime for a moved file. Keeps faces, thumbnails, etc."""
+    session.query(File).filter_by(id=file_id).update({
+        "path": new_path,
+        "mtime": new_mtime,
+    })
+    session.flush()
 
 
 def add_face(

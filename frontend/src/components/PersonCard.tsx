@@ -43,6 +43,12 @@ export default function PersonCard({ cluster, onClick, selectable, selected, sim
             alt={label}
             className="w-full h-full object-cover group-hover:scale-105 transition-transform"
             loading="lazy"
+            onError={(e) => {
+              const t = e.target as HTMLImageElement;
+              const fallback = api.thumbnailUrl(cluster.cover_thumbnail);
+              if (fallback) t.src = fallback;
+              else t.style.display = "none";
+            }}
           />
         ) : null}
         {!cluster.cover_face_id && !thumb && (

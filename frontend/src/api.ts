@@ -25,6 +25,7 @@ export interface ClusterSimilarOut extends ClusterOut {
 
 export interface FaceOut {
   id: number;
+  file_id?: number | null;
   bbox: number[];
   det_score: number | null;
   cluster_id: number | null;
@@ -42,6 +43,7 @@ export interface FileOut {
   thumbnail_path: string | null;
   width: number | null;
   height: number | null;
+  duration: number | null;  // seconds, for videos
   faces: FaceOut[];
 }
 
@@ -60,6 +62,21 @@ export interface Stats {
   total_videos: number;
   total_faces: number;
   unassigned_faces: number;
+}
+
+export interface MemoryOut {
+  id: number;
+  label: string;
+  cluster_id: number | null;
+  file_count: number;
+  cover_thumbnail: string | null;
+}
+
+export interface AlbumOut {
+  id: number;
+  label: string;
+  file_count: number;
+  cover_thumbnail: string | null;
 }
 
 export const api = {
@@ -104,8 +121,18 @@ export const api = {
       body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
     }),
 
-  getPhotos: (skip = 0, limit = 100) =>
-    apiFetch<FileOut[]>(`/photos/?skip=${skip}&limit=${limit}`),
+  addVideoToPerson: (personId: number, fileId: number) =>
+    apiFetch<ClusterOut>(`/people/${personId}/add-video?file_id=${fileId}`, {
+      method: "POST",
+    }),
+
+  getPhotos: (skip = 0, limit = 100, fileType?: "photo" | "video") =>
+    apiFetch<FileOut[]>(`/photos/?skip=${skip}&limit=${limit}${fileType ? `&file_type=${fileType}` : ""}`),
+
+  getVideos: (skip = 0, limit = 100) =>
+    apiFetch<FileOut[]>(`/photos/?skip=${skip}&limit=${limit}&file_type=video`),
+
+  getPhoto: (photoId: number) => apiFetch<FileOut>(`/photos/${photoId}`),
 
   updatePhotoDate: (photoId: number, exifDate: string | null) =>
     apiFetch<FileOut>(`/photos/${photoId}`, {
@@ -125,6 +152,10 @@ export const api = {
     }>(`/photos/${photoId}/date-metadata`),
 
   getStats: () => apiFetch<Stats>("/photos/stats/summary"),
+  getFileExtensions: () =>
+    apiFetch<{ extension: string; count: number; example_file_id: number; file_type: string }[]>(
+      "/photos/file-extensions"
+    ),
 
   searchByFace: (file: File, topK = 20) => {
     const form = new FormData();
@@ -204,4 +235,179 @@ export const api = {
 
   faceCropUrl: (fileId: number, bbox: number[]) =>
     `${BASE}/originals/${fileId}/crop?bbox=${bbox.map((v) => v.toFixed(4)).join(",")}`,
+
+  // Recuerdos (memories)
+  getMemories: () => apiFetch<MemoryOut[]>("/memories/"),
+  createMemory: (label: string, clusterId?: number) =>
+    apiFetch<MemoryOut>("/memories/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, cluster_id: clusterId ?? null }),
+    }),
+  getMemory: (id: number) => apiFetch<MemoryOut>(`/memories/${id}`),
+  renameMemory: (memoryId: number, label: string) =>
+    apiFetch<MemoryOut>(`/memories/${memoryId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    }),
+  addFilesToMemory: (memoryId: number, fileIds: number[]) =>
+    apiFetch<{ status: string }>(`/memories/${memoryId}/add-files`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  removeFileFromMemory: (memoryId: number, fileId: number) =>
+    apiFetch<{ status: string }>(`/memories/${memoryId}/files/${fileId}`, {
+      method: "DELETE",
+    }),
+  getMemoryPhotos: (memoryId: number) =>
+    apiFetch<FileOut[]>(`/memories/${memoryId}/photos`),
+  findSimilarMemoryInPage: (
+    memoryId: number,
+    fileIds: number[],
+    minSimilarity = 0.35,
+    forceClip = false,
+    maxNew = 50
+  ) =>
+    apiFetch<{
+      use_clip: boolean;
+      sample_count: number;
+      cached_count: number;
+      computed_count: number;
+      results: { file_id: number; similarity: number }[];
+    }>(
+      `/memories/${memoryId}/find-similar?min_similarity=${minSimilarity}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_ids: fileIds, force_clip: forceClip, max_new: maxNew }),
+      }
+    ),
+
+  // Álbumes
+  getAlbums: () => apiFetch<AlbumOut[]>("/albums/"),
+  createAlbum: (label: string) =>
+    apiFetch<AlbumOut>("/albums/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    }),
+  getAlbum: (id: number) => apiFetch<AlbumOut>(`/albums/${id}`),
+  renameAlbum: (albumId: number, label: string) =>
+    apiFetch<AlbumOut>(`/albums/${albumId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    }),
+  addFilesToAlbum: (albumId: number, fileIds: number[]) =>
+    apiFetch<{ status: string }>(`/albums/${albumId}/add-files`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  removeFileFromAlbum: (albumId: number, fileId: number) =>
+    apiFetch<{ status: string }>(`/albums/${albumId}/files/${fileId}`, {
+      method: "DELETE",
+    }),
+  getAlbumPhotos: (albumId: number) =>
+    apiFetch<(FileOut & { use_in_centroid?: boolean })[]>(`/albums/${albumId}/photos`),
+  setAlbumFileUseInCentroid: (albumId: number, fileId: number, useInCentroid: boolean) =>
+    apiFetch<{ status: string }>(`/albums/${albumId}/files/${fileId}/use-in-centroid`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ use_in_centroid: useInCentroid }),
+    }),
+  reorderAlbumPhotos: (albumId: number, fileIds: number[]) =>
+    apiFetch<{ status: string }>(`/albums/${albumId}/reorder`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  findSimilarInPage: (
+    albumId: number,
+    fileIds: number[],
+    minSimilarity = 0.35,
+    forceClip = false,
+    maxNew = 1000,
+    excludeFacesFromCentroid = false
+  ) =>
+    apiFetch<{
+      use_clip: boolean;
+      sample_count: number;
+      sample_file_ids?: number[];
+      cached_count: number;
+      computed_count: number;
+      results: { file_id: number; similarity: number }[];
+    }>(
+      `/albums/${albumId}/find-similar?min_similarity=${minSimilarity}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_ids: fileIds,
+          force_clip: forceClip,
+          max_new: maxNew,
+          exclude_faces_from_centroid: excludeFacesFromCentroid,
+        }),
+      }
+    ),
+  getAlbumSearchCacheStats: (albumId: number) =>
+    apiFetch<{
+      total_photos: number;
+      cached_count: number;
+      positive_count: number;
+      negative_count: number;
+      pending_count: number;
+    }>(`/albums/${albumId}/search-cache-stats`),
+  deleteAlbumSearchCache: (albumId: number) =>
+    apiFetch<{ deleted: number }>(`/albums/${albumId}/search-cache`, { method: "DELETE" }),
+  setCacheManualStatus: (albumId: number, fileId: number, status: "positive" | "negative") =>
+    apiFetch<{ status: string; file_id: number }>(
+      `/albums/${albumId}/search-cache/${fileId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      }
+    ),
+  findSimilarLibrary: (
+    albumId: number,
+    maxNew = 1000,
+    forceClip = true,
+    excludeFacesFromCentroid = false
+  ) =>
+    apiFetch<{
+      use_clip: boolean;
+      sample_count: number;
+      sample_file_ids?: number[];
+      cached_count: number;
+      computed_count: number;
+      results: { file_id: number; similarity: number }[];
+    }>(
+      `/albums/${albumId}/find-similar-library?min_similarity=0.35&max_new=${maxNew}&force_clip=${forceClip}&exclude_faces_from_centroid=${excludeFacesFromCentroid}`
+    ),
+  getAlbumSearchCache: (
+    albumId: number,
+    status: "positive" | "negative" | "all" = "all",
+    skip = 0,
+    limit = 100,
+    includeFiles = true
+  ) =>
+    apiFetch<{
+      items: { file_id: number; similarity: number; file?: FileOut }[];
+      total: number;
+      status: string;
+    }>(`/albums/${albumId}/search-cache?status=${status}&skip=${skip}&limit=${limit}&include_files=${includeFiles}`),
+
+  /** Solo entre fileIds cargados en la página (p. ej. All Photos). No escanea toda la biblioteca. */
+  findSimilarPersonInPage: (personId: number, fileIds: number[], minSimilarity = 0.35) =>
+    apiFetch<{ file_id: number; similarity: number }[]>(
+      `/people/${personId}/find-similar-in-page?min_similarity=${minSimilarity}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_ids: fileIds }),
+      }
+    ),
 };

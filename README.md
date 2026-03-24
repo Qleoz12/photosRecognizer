@@ -1,62 +1,79 @@
 # PhotosRecognizer
 
-Local face recognition photo search — a self-hosted alternative to Google Photos that works entirely offline.
+Reconocimiento facial local para fotos y videos — alternativa a Google Photos que funciona 100% offline.
 
-## Features
+## Uso rápido
 
-- Scans 10,000–100,000+ photos and videos from any local directory
-- Detects and embeds faces using **InsightFace** (`buffalo_l` model)
-- Groups faces into people clusters automatically with **HDBSCAN**
-- Web UI to browse photos by person, view timeline, rename people, merge clusters
-- Search by uploading a face photo — finds all matching photos instantly
-- AMD GPU acceleration via DirectML (Windows) or ROCm (Linux)
-- Incremental indexing — only processes new/changed files
+1. **Copia** tus fotos y videos en `data/photos/` (puedes usar subcarpetas: 2016, 2025, etc.)
+2. **Ejecuta** `index_and_cluster.bat` (o `index_and_cluster.bat "D:\Mis Fotos"` si están en otra ruta)
+3. **Inicia** la app con `start.bat` y abre **http://localhost:5892**
 
-## Requirements
+📖 **Instrucciones completas en español:** [INSTRUCCIONES.md](INSTRUCCIONES.md)
+
+### Mover a otro disco
+
+| Situación | Qué hacer |
+|-----------|-----------|
+| Mover proyecto completo, conservar indexado | `update_paths.bat "RUTA_VIEJA\data\photos" "RUTA_NUEVA\data\photos"` |
+| Pegar carpetas nuevas en data/photos | `index_and_cluster.bat` |
+| Empezar de cero | `reindex_all.bat` |
+
+---
+
+## Características
+
+- Escanea 10.000–100.000+ fotos y videos desde cualquier carpeta local
+- Detecta y agrupa caras con **InsightFace** (modelo `buffalo_l`)
+- Agrupa personas automáticamente con **HDBSCAN**
+- Web UI: personas, All Photos, Videos, Recuerdos, Álbumes, búsqueda por cara
+- Soporte completo para videos (thumbnails, duración, detección de caras en frames)
+- Aceleración GPU AMD (DirectML en Windows, ROCm en Linux)
+- Indexación incremental — solo procesa archivos nuevos o modificados
+
+### Buscar similares (Álbumes y Recuerdos)
+
+En un álbum o recuerdo puedes usar **"Buscar similares aquí"** para encontrar fotos parecidas sin salir a la galería. Hay dos modos:
+
+| Modo | Para qué sirve | Cómo funciona | Tiempo aprox. |
+|------|----------------|---------------|---------------|
+| **Contenido (documentos)** | Documentos, papeles, IDs, facturas, radiografías | Usa **CLIP**: calcula un embedding por cada foto del pool | ~1 min (200 fotos) |
+| **Caras** | Personas, retratos | Usa **embeddings de rostros** ya guardados en la base de datos | < 5 s (5.000 fotos) |
+
+**¿Por qué CLIP es más lento?** El modo documentos usa el modelo CLIP para representar el contenido de cada imagen. No hay embeddings precalculados — cada foto del pool se procesa en ese momento.
+
+**Cache en base de datos:** Los resultados (positivos y negativos) se guardan en `album_search_cache` y `memory_search_cache`. Cada request procesa como mucho 100 fotos nuevas; el resto se lee del cache. Así puedes ir procesando toda la colección de a poco: la primera búsqueda tarda ~30 s (100 CLIP), las siguientes son casi instantáneas si las fotos ya están en cache. Al cambiar el contenido del álbum/recuerdo, el cache se invalida automáticamente.
+
+**Cluster del álbum:** En el modal verás miniaturas de las fotos que definen la búsqueda (las del álbum/recuerdo). Si quieres cambiar qué se usa, quita fotos que no deban influir y vuelve a buscar.
+
+## Requisitos
 
 - Python 3.11+
 - Node.js 18+
-- ffmpeg in PATH (for video frame extraction)
-- 4 GB RAM minimum (8 GB recommended)
+- ffmpeg en PATH (para extraer frames de videos)
+- 4 GB RAM mínimo (8 GB recomendado para muchos archivos)
 
-## Installation
+## Instalación (primera vez)
 
-```bash
-# 1. Install Python dependencies
+```batch
 pip install -r requirements.txt
-
-# 2. Install frontend dependencies
 cd frontend
 npm install --ignore-scripts
+copy .env.example .env
 cd ..
 ```
 
-## First-Time Setup
+## Scripts de Windows
 
-```bash
-# Index your photos (replace with your actual photos path)
-python -m indexer.run --root "D:\Photos" --workers 2
-
-# Cluster the faces
-python -m clustering.cluster_faces
-
-# Start the API server
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
-
-# In another terminal, start the frontend
-cd frontend
-npm run dev
-```
-
-Then open **http://localhost:5173** in your browser.
-
-Or use the batch scripts:
-
-```
-index_and_cluster.bat "D:\Photos"
-start_api.bat
-start_frontend.bat
-```
+| Script | Descripción |
+|--------|-------------|
+| `setup.bat` | Primera vez: instala dependencias y crea carpetas |
+| `index_and_cluster.bat` | Indexa `data/photos/` y agrupa caras |
+| `index_and_cluster.bat "Ruta"` | Indexa desde otra carpeta |
+| `index_and_cluster.bat "Ruta" 4` | Con 4 workers en paralelo |
+| `start.bat` | Inicia API (8732) + frontend (5892) |
+| `stop.bat` | Detiene la aplicación |
+| `update_paths.bat "OLD" "NEW"` | Actualiza rutas tras mover a otro disco |
+| `reindex_all.bat` | Borra todo y reindexa desde cero |
 
 ## AMD GPU Acceleration
 
