@@ -2,6 +2,7 @@
 Database models and initialization.
 Tables: files, faces, clusters
 """
+import sqlite3
 import struct
 from pathlib import Path
 from datetime import datetime as dt
@@ -31,6 +32,8 @@ class File(Base):
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
     duration = Column(Float, nullable=True)  # seconds, for videos
+    # 1 = archivada (oculta en galería principal; ver / desarchivar con PIN)
+    archived = Column(Integer, nullable=False, default=0)
 
     faces = relationship("Face", back_populates="file", cascade="all, delete-orphan")
 
@@ -44,8 +47,11 @@ class Cluster(Base):
     size = Column(Integer, default=0)
     # 1 = created/merged/renamed manually by user; survives re-clustering
     is_manual = Column(Integer, default=0, nullable=False)
+    # 1 = oculto en listado Personas (no se pide en GET /people salvo include_hidden)
+    is_hidden = Column(Integer, default=0, nullable=False)
 
     faces = relationship("Face", back_populates="cluster", foreign_keys="Face.cluster_id")
+    cover_face = relationship("Face", foreign_keys=[cover_face_id])
 
 
 class Memory(Base):
@@ -124,6 +130,20 @@ class MemorySearchCache(Base):
     computed_at = Column(DateTime, default=dt.utcnow, nullable=True)
 
 
+class ShareCollection(Base):
+    """
+    Enlace temporal para compartir una recopilación de personas (solo lectura: miniaturas / originales vía token).
+    """
+
+    __tablename__ = "share_collections"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    person_ids_json = Column(Text, nullable=False)  # JSON array de cluster ids
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=dt.utcnow, nullable=True)
+
+
 class Face(Base):
     __tablename__ = "faces"
 
@@ -140,22 +160,8 @@ class Face(Base):
     cluster = relationship("Cluster", back_populates="faces", foreign_keys=[cluster_id])
 
 
-def get_engine(db_path: Path = DB_PATH):
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        echo=False,
-        connect_args={"check_same_thread": False, "timeout": 30},
-    )
-
-    @event.listens_for(engine, "connect")
-    def set_wal(dbapi_conn, _):
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=10000")
-        cursor.close()
-
+def _apply_sqlite_schema_and_migrations(engine) -> None:
+    """Crear tablas y migraciones incrementales (solo motor de escritura)."""
     Base.metadata.create_all(engine)
 
     # Migration: add is_manual column to existing databases
@@ -164,6 +170,15 @@ def get_engine(db_path: Path = DB_PATH):
         if "is_manual" not in cols:
             conn.execute(text(
                 "ALTER TABLE clusters ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0"
+            ))
+            conn.commit()
+
+    # Migration: clusters.is_hidden (ocultar del listado principal)
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(clusters)")).fetchall()]
+        if "is_hidden" not in cols:
+            conn.execute(text(
+                "ALTER TABLE clusters ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0"
             ))
             conn.commit()
 
@@ -239,6 +254,46 @@ def get_engine(db_path: Path = DB_PATH):
                     )
             conn.commit()
 
+    # Migration: files.archived
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(files)")).fetchall()]
+        if cols and "archived" not in cols:
+            conn.execute(text("ALTER TABLE files ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"))
+            conn.commit()
+
+
+def get_engine(db_path: Path = DB_PATH, read_only: bool = False):
+    """
+    Motor SQLite. Con read_only=True abre la BD en modo solo lectura (URI ?mode=ro), sin migraciones.
+    Usado por workers del API cuando PHOTOS_API_MODE=read.
+    """
+    resolved = db_path.resolve()
+    if read_only:
+        if not resolved.is_file():
+            raise FileNotFoundError(f"SQLite DB no encontrada (modo lectura): {resolved}")
+        uri = resolved.as_uri() + "?mode=ro"
+
+        def _connect_ro():
+            return sqlite3.connect(uri, uri=True, timeout=60, check_same_thread=False)
+
+        return create_engine("sqlite://", creator=_connect_ro, echo=False)
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(
+        f"sqlite:///{resolved.as_posix()}",
+        echo=False,
+        connect_args={"check_same_thread": False, "timeout": 60},
+    )
+
+    @event.listens_for(engine, "connect")
+    def set_wal(dbapi_conn, _):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.close()
+
+    _apply_sqlite_schema_and_migrations(engine)
     return engine
 
 
