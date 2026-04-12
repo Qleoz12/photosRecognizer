@@ -2,15 +2,55 @@
 CRUD operations for storing and retrieving embeddings, files, and faces from SQLite.
 """
 import json
+import os
 import struct
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .db import File, Face, Cluster, embedding_to_bytes, bytes_to_embedding
+
+_centroid_lock = threading.RLock()
+_centroid_cache: Optional[Dict[int, np.ndarray]] = None
+_centroid_cache_token: Optional[tuple] = None
+_centroid_cache_mono: float = 0.0
+
+
+def _centroid_cache_ttl_sec() -> float:
+    try:
+        return max(30.0, float(os.environ.get("CLUSTER_CENTROID_CACHE_TTL_SEC", "300")))
+    except ValueError:
+        return 300.0
+
+
+def invalidate_cluster_centroids_cache() -> None:
+    """Invalidar cache en memoria de centroides (tras mutar caras/clusters o re-cluster)."""
+    global _centroid_cache, _centroid_cache_token, _centroid_cache_mono
+    with _centroid_lock:
+        _centroid_cache = None
+        _centroid_cache_token = None
+        _centroid_cache_mono = 0.0
+
+
+def _centroid_cache_fingerprint(session: Session) -> tuple:
+    """Huella ligera para detectar cambios de cardinalidad (indexación, merges, etc.)."""
+    row = session.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM faces WHERE cluster_id IS NOT NULL AND is_canonical = 1),
+                (SELECT COALESCE(MAX(id), 0) FROM faces),
+                (SELECT COUNT(*) FROM clusters)
+            """
+        )
+    ).one()
+    return (int(row[0]), int(row[1]), int(row[2]))
 
 
 def upsert_file(
@@ -131,14 +171,7 @@ def get_all_embeddings(session: Session) -> Tuple[List[int], np.ndarray]:
     return face_ids, embeddings
 
 
-def get_cluster_centroids(session: Session) -> dict[int, np.ndarray]:
-    """
-    Compute centroid (mean embedding) per cluster.
-    Returns {cluster_id: embedding_512}.
-    Only uses canonical faces (is_canonical=1) for the centroid.
-    """
-    from .db import bytes_to_embedding
-
+def _compute_cluster_centroids_uncached(session: Session) -> Dict[int, np.ndarray]:
     rows = session.query(Face.cluster_id, Face.embedding).filter(
         Face.cluster_id.isnot(None),
         Face.is_canonical == 1,
@@ -151,11 +184,36 @@ def get_cluster_centroids(session: Session) -> dict[int, np.ndarray]:
         emb = bytes_to_embedding(emb_bytes)
         by_cluster.setdefault(cid, []).append(emb)
 
-    centroids = {}
+    centroids: Dict[int, np.ndarray] = {}
     for cid, embs in by_cluster.items():
         stack = np.stack(embs)
         centroids[cid] = stack.mean(axis=0).astype(np.float32)
     return centroids
+
+
+def get_cluster_centroids(session: Session) -> Dict[int, np.ndarray]:
+    """
+    Centroides por cluster (caras canónicas). Resultado cacheado en proceso con TTL
+    (CLUSTER_CENTROID_CACHE_TTL_SEC, default 300). Tras mutaciones, llamar
+    invalidate_cluster_centroids_cache().
+    """
+    global _centroid_cache, _centroid_cache_token, _centroid_cache_mono
+    token = _centroid_cache_fingerprint(session)
+    now = time.monotonic()
+    ttl = _centroid_cache_ttl_sec()
+    with _centroid_lock:
+        if (
+            _centroid_cache is not None
+            and _centroid_cache_token == token
+            and (now - _centroid_cache_mono) < ttl
+        ):
+            return {k: v.copy() for k, v in _centroid_cache.items()}
+    data = _compute_cluster_centroids_uncached(session)
+    with _centroid_lock:
+        _centroid_cache = {k: v.copy() for k, v in data.items()}
+        _centroid_cache_token = token
+        _centroid_cache_mono = time.monotonic()
+    return {k: v.copy() for k, v in data.items()}
 
 
 def update_face_cluster(session: Session, face_id: int, cluster_id: Optional[int]):

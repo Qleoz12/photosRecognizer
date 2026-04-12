@@ -53,7 +53,7 @@ echo  Configuracion completada.
 echo.
 echo  Siguiente:
 echo  1. Copia tus fotos y videos en data\photos\
-echo  2. Ejecuta: index_and_cluster.bat
+echo  2. Ejecuta: photos_db.bat   (o index_and_cluster.bat, es lo mismo)
 echo  3. Ejecuta: start.bat
 echo  4. Abre: http://localhost:5892
 echo ============================================================

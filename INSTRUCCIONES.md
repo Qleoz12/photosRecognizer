@@ -200,16 +200,16 @@ Si quieres **borrar todo** y reindexar solo con las carpetas que vas a pegar:
 4. Ejecuta:
 
 ```batch
-reindex_all.bat
+photos_db.bat recreate
 ```
 
 O si tus fotos están en otra ruta:
 
 ```batch
-reindex_all.bat "E:\Mis Fotos"
+photos_db.bat recreate "E:\Mis Fotos" 2
 ```
 
-**Atención:** Borra la base de datos. Recuerdos y álbumes se pierden.
+**Atención:** La BD actual se **mueve** a `data/db_backup/backup_<fecha>/` (no va a la papelera). Luego se crea una BD nueva y se reindexa todo. Recuerdos y álbumes de la copia vieja solo siguen existiendo en ese respaldo.
 
 ---
 
@@ -220,7 +220,9 @@ reindex_all.bat "E:\Mis Fotos"
 | Mover proyecto a otro disco, conservar indexado | `update_paths.bat "RUTA_VIEJA" "RUTA_NUEVA"` |
 | Pegar carpetas nuevas en data/photos | `index_and_cluster.bat` |
 | Mover + pegar nuevas carpetas | `update_paths.bat` → `index_and_cluster.bat` |
-| Empezar de cero con carpetas nuevas | `reindex_all.bat` o `reindex_all.bat "Ruta"` |
+| Empezar de cero con carpetas nuevas | `photos_db.bat recreate` o `photos_db.bat recreate "Ruta" 2` |
+| Copia de seguridad de la BD (sin reindexar) | `photos_db.bat snapshot` |
+| Intentar salvar SQLite dañado | `photos_db.bat recover "archivo.db"` |
 
 ---
 
@@ -229,16 +231,16 @@ reindex_all.bat "E:\Mis Fotos"
 Si cambias de carpeta o quieres empezar de nuevo:
 
 ```batch
-reindex_all.bat
+photos_db.bat recreate
 ```
 
 O con ruta personalizada:
 
 ```batch
-reindex_all.bat "D:\Nueva Carpeta"
+photos_db.bat recreate "D:\Nueva Carpeta" 2
 ```
 
-**Atención:** Borra la base de datos actual. Los recuerdos y álbumes se pierden.
+**Atención:** La BD actual se mueve a `data/db_backup/`. Los recuerdos y álbumes quedan en esa copia; la app usa una BD nueva.
 
 ---
 
@@ -312,9 +314,9 @@ photosRecognizer/
 ├── logs/                  ← Logs del indexador y API
 │   ├── index_*.log
 │   └── api.log
-├── index_and_cluster.bat  ← Indexar + agrupar caras
+├── photos_db.bat          ← Indexado, recreate, snapshot, recover (ver README)
+├── index_and_cluster.bat  ← Alias de photos_db.bat (incremental + cluster)
 ├── update_paths.bat       ← Actualizar rutas tras mover a otro disco
 ├── start.bat              ← Iniciar API + frontend
-├── stop.bat               ← Detener todo
-└── reindex_all.bat        ← Borrar y reindexar desde cero
+└── stop.bat               ← Detener todo
 ```

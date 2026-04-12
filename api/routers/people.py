@@ -4,30 +4,42 @@
 import base64
 import json
 import logging
+import os
+import tempfile
+import zipfile
 from datetime import datetime, timezone
 from typing import List, Optional
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from pathlib import Path
 
 from api.deps import get_session
 from api.models import ClusterOut, ClusterSimilarOut, FileOut, ClusterUpdateIn, MergeClustersIn, CreateClusterIn, AddFaceIn, AssignFaceIn, FaceOut, SetFaceCanonicalIn
 from indexer.db import Cluster, Face, File, bytes_to_embedding, embedding_to_bytes
-from indexer.embeddings_store import get_cluster_centroids
+from indexer.embeddings_store import get_cluster_centroids, invalidate_cluster_centroids_cache
+from indexer.query_patterns import eager_load_cluster_cover_thumbnail, eager_load_file_faces_metadata
 from indexer.face_detector import load_image, detect_faces
 from indexer.region_embedder import embed_region
+from indexer.video_extractor import extract_first_frame_any
 
 router = APIRouter(prefix="/people", tags=["people"])
+
+
+def _commit_invalidate_centroids(session: Session) -> None:
+    session.commit()
+    invalidate_cluster_centroids_cache()
 
 
 def _cluster_to_out(cluster: Cluster, session: Session) -> ClusterOut:
     cover_thumb = None
     if cluster.cover_face_id:
-        face = session.get(Face, cluster.cover_face_id)
+        face = cluster.cover_face if cluster.cover_face else session.get(Face, cluster.cover_face_id)
         if face and face.file:
             cover_thumb = face.file.thumbnail_path
     return ClusterOut(
@@ -37,6 +49,7 @@ def _cluster_to_out(cluster: Cluster, session: Session) -> ClusterOut:
         cover_face_id=cluster.cover_face_id,
         cover_thumbnail=cover_thumb,
         is_manual=bool(cluster.is_manual),
+        is_hidden=bool(getattr(cluster, "is_hidden", 0)),
     )
 
 
@@ -44,15 +57,24 @@ def _cluster_to_out(cluster: Cluster, session: Session) -> ClusterOut:
 def list_people(
     skip: int = Query(0, ge=0),
     limit: int = Query(500, ge=1, le=2000),
+    include_hidden: bool = Query(False, description="Si true, solo personas con is_hidden=1 (gestión de ocultas)."),
     session: Session = Depends(get_session),
 ):
-    """List all people (clusters) that have at least one face. Ordered by size descending."""
+    """List people (clusters) with at least one face. Por defecto excluye ocultas."""
     # Exclude orphaned clusters (size>0 but no faces - e.g. after merge source not deleted)
-    clusters = (
+    q = (
         session.query(Cluster)
+        .options(eager_load_cluster_cover_thumbnail())
         .join(Face, Face.cluster_id == Cluster.id)
         .distinct()
-        .order_by(Cluster.is_manual.desc(), Cluster.size.desc())
+    )
+    # COALESCE: filas creadas antes de la migración o valores NULL no revierten el filtro
+    if include_hidden:
+        q = q.filter(func.coalesce(Cluster.is_hidden, 0) == 1)
+    else:
+        q = q.filter(func.coalesce(Cluster.is_hidden, 0) == 0)
+    clusters = (
+        q.order_by(Cluster.is_manual.desc(), Cluster.size.desc())
         .offset(skip)
         .limit(limit)
         .all()
@@ -62,7 +84,12 @@ def list_people(
 
 @router.get("/{person_id}", response_model=ClusterOut)
 def get_person(person_id: int, session: Session = Depends(get_session)):
-    cluster = session.get(Cluster, person_id)
+    cluster = (
+        session.query(Cluster)
+        .options(eager_load_cluster_cover_thumbnail())
+        .filter(Cluster.id == person_id)
+        .one_or_none()
+    )
     if not cluster:
         raise HTTPException(404, "Person not found")
     # Sync size with actual face count (fixes orphaned clusters from merges/re-clustering)
@@ -71,16 +98,16 @@ def get_person(person_id: int, session: Session = Depends(get_session)):
         cluster.size = actual
         if actual == 0 and not cluster.is_manual:
             session.delete(cluster)
-            session.commit()
+            _commit_invalidate_centroids(session)
             raise HTTPException(404, "Person not found")
-        session.commit()
+        _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
 @router.get("/{person_id}/similar", response_model=List[ClusterSimilarOut])
 def get_similar_people(
     person_id: int,
-    limit: int = Query(15, ge=1, le=50),
+    limit: int = Query(15, ge=1, le=200),
     min_similarity: float = Query(0.5, ge=0.0, le=1.0),
     session: Session = Depends(get_session),
 ):
@@ -99,9 +126,14 @@ def get_similar_people(
     target = centroids[person_id]
     target_norm = target / (np.linalg.norm(target) or 1e-9)
 
+    hidden_ids = {
+        r[0]
+        for r in session.query(Cluster.id).filter(func.coalesce(Cluster.is_hidden, 0) == 1).all()
+    }
+
     results = []
     for cid, centroid in centroids.items():
-        if cid == person_id:
+        if cid == person_id or cid in hidden_ids:
             continue
         sim = float(np.dot(target_norm, centroid / (np.linalg.norm(centroid) or 1e-9)))
         sim = max(0.0, min(1.0, sim))
@@ -111,9 +143,19 @@ def get_similar_people(
     results.sort(key=lambda x: -x[1])
     results = results[:limit]
 
+    if not results:
+        return []
+    cids = [cid for cid, _ in results]
+    clusters_by_id = {
+        c.id: c
+        for c in session.query(Cluster)
+        .options(eager_load_cluster_cover_thumbnail())
+        .filter(Cluster.id.in_(cids))
+        .all()
+    }
     out = []
     for cid, sim in results:
-        c = session.get(Cluster, cid)
+        c = clusters_by_id.get(cid)
         if c:
             o = _cluster_to_out(c, session)
             out.append(ClusterSimilarOut(**o.model_dump(), similarity=round(sim, 4)))
@@ -130,7 +172,15 @@ class SimilarFileInPage(BaseModel):
     similarity: float
 
 
-@router.post("/{person_id}/find-similar-in-page", response_model=List[SimilarFileInPage])
+class PersonFindSimilarOut(BaseModel):
+    """Respuesta con progreso: pool, ya en persona, sin caras para comparar."""
+    results: List[SimilarFileInPage]
+    pool_size: int
+    skipped_already_in_person: int
+    skipped_no_faces: int
+
+
+@router.post("/{person_id}/find-similar-in-page", response_model=PersonFindSimilarOut)
 def find_similar_person_in_loaded_page(
     person_id: int,
     body: FindSimilarPageIn,
@@ -154,7 +204,7 @@ def find_similar_person_in_loaded_page(
     if not face_rows:
         face_rows = session.query(Face).filter(Face.cluster_id == person_id).all()
     if not face_rows:
-        return []
+        return PersonFindSimilarOut(results=[], pool_size=len(body.file_ids), skipped_already_in_person=0, skipped_no_faces=0)
 
     embs = [bytes_to_embedding(f.embedding) for f in face_rows]
     centroid = np.stack(embs).mean(axis=0).astype(np.float32)
@@ -170,14 +220,22 @@ def find_similar_person_in_loaded_page(
 
     results: List[SimilarFileInPage] = []
     seen: set[int] = set()
+    skipped_already = 0
+    skipped_no_faces = 0
     for fid in body.file_ids:
-        if fid in seen or fid in already_person:
+        if fid in seen:
+            continue
+        if fid in already_person:
+            skipped_already += 1
             continue
         f = session.get(File, fid)
         if not f or f.file_type != "photo":
             continue
+        if getattr(f, "archived", 0) == 1:
+            continue
         faces = session.query(Face).filter_by(file_id=fid).all()
         if not faces:
+            skipped_no_faces += 1
             continue
         best_sim = -1.0
         for face in faces:
@@ -191,7 +249,12 @@ def find_similar_person_in_loaded_page(
             seen.add(fid)
 
     results.sort(key=lambda x: x.similarity, reverse=True)
-    return results[:50]
+    return PersonFindSimilarOut(
+        results=results[:50],
+        pool_size=len(body.file_ids),
+        skipped_already_in_person=skipped_already,
+        skipped_no_faces=skipped_no_faces,
+    )
 
 
 @router.get("/{person_id}/photos", response_model=List[FileOut])
@@ -209,9 +272,10 @@ def get_person_photos(
     # JOIN ensures we get files that have at least one face in this cluster
     files = (
         session.query(File)
-        .options(joinedload(File.faces))
+        .options(eager_load_file_faces_metadata())
         .join(Face, Face.file_id == File.id)
         .filter(Face.cluster_id == person_id)
+        .filter(File.archived == 0)
         .distinct()
         .order_by(File.exif_date.desc(), File.id.asc())
         .offset(skip)
@@ -251,6 +315,7 @@ def get_person_photos(
             height=f.height,
             duration=getattr(f, "duration", None),
             faces=faces_out,
+            archived=bool(getattr(f, "archived", 0)),
         ))
     return result
 
@@ -269,7 +334,7 @@ def create_person(
     )
     session.add(cluster)
     session.flush()
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
@@ -293,7 +358,11 @@ def update_person(
         if face.cluster_id != person_id:
             raise HTTPException(400, "El rostro debe pertenecer a esta persona")
         cluster.cover_face_id = body.cover_face_id
-    session.commit()
+    if body.is_hidden is not None:
+        cluster.is_hidden = 1 if body.is_hidden else 0
+    session.flush()
+    _commit_invalidate_centroids(session)
+    session.refresh(cluster)
     return _cluster_to_out(cluster, session)
 
 
@@ -320,7 +389,7 @@ def assign_face_to_person(
         old_cluster = session.get(Cluster, old_cid)
         if old_cluster:
             old_cluster.size = session.query(Face).filter(Face.cluster_id == old_cid).count()
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
@@ -425,7 +494,7 @@ def add_face_to_person(
     cluster.size = session.query(Face).filter(Face.cluster_id == person_id).count()
     if cluster.cover_face_id is None:
         cluster.cover_face_id = face.id
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
@@ -433,9 +502,19 @@ def add_face_to_person(
 def add_video_to_person(
     person_id: int,
     file_id: int = Query(..., description="Video file ID"),
+    strict_faces: bool = Query(
+        False,
+        description="Si true, exige un rostro ya indexado (error si el índice no detectó ninguno).",
+    ),
     session: Session = Depends(get_session),
 ):
-    """Asigna un video a una persona usando el primer rostro detectado en el video."""
+    """
+    Asigna un vídeo a una persona.
+
+    Si el índice ya tiene caras en ese archivo, reutiliza la primera.
+    Si no hay caras y strict_faces=false (default), extrae un fotograma, embedding CLIP
+    y crea una cara placeholder (is_canonical=0) para no mezclar con centroides faciales.
+    """
     cluster = session.get(Cluster, person_id)
     if not cluster:
         raise HTTPException(404, "Person not found")
@@ -447,13 +526,44 @@ def add_video_to_person(
 
     face = session.query(Face).filter(Face.file_id == file_id).first()
     if not face:
-        raise HTTPException(400, "El video no tiene rostros detectados. Reindexa el video.")
+        if strict_faces:
+            raise HTTPException(
+                400,
+                "El video no tiene rostros detectados. Reindexa el video o llama sin strict_faces.",
+            )
+        vpath = Path(f.path)
+        frame = extract_first_frame_any(vpath)
+        if frame is None:
+            raise HTTPException(
+                422,
+                "No se pudo extraer un fotograma del vídeo (¿ffmpeg instalado?). "
+                "Reindexa o revisa el archivo.",
+            )
+        w, h = frame.size
+        try:
+            emb = embed_region(frame.convert("RGB"))
+        except Exception as e:
+            log = logging.getLogger("photos_recognizer")
+            log.warning("add-video placeholder CLIP failed file=%s: %s", file_id, e)
+            raise HTTPException(422, "No se pudo calcular embedding del fotograma (CLIP).")
+        bbox_px = [0.0, 0.0, float(w), float(h)]
+        face = Face(
+            file_id=file_id,
+            bbox_json=json.dumps(bbox_px),
+            embedding=embedding_to_bytes(emb),
+            det_score=0.12,
+            cluster_id=person_id,
+            is_canonical=0,
+        )
+        session.add(face)
+        session.flush()
+    else:
+        face.cluster_id = person_id
 
-    face.cluster_id = person_id
     cluster.size = session.query(Face).filter(Face.cluster_id == person_id).count()
     if cluster.cover_face_id is None:
         cluster.cover_face_id = face.id
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
@@ -473,7 +583,7 @@ def set_face_canonical(
     if face.cluster_id != person_id:
         raise HTTPException(400, "Este rostro no pertenece a esta persona")
     face.is_canonical = 1 if body.is_canonical else 0
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
 
 
@@ -499,8 +609,60 @@ def remove_face_from_person(
     if cluster.cover_face_id == face.id:
         other = session.query(Face).filter(Face.cluster_id == person_id).first()
         cluster.cover_face_id = other.id if other else None
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(cluster, session)
+
+
+@router.get("/{person_id}/download.zip")
+def download_person_zip(
+    person_id: int,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
+    """ZIP con todas las fotos/vídeos del cluster (no archivados). Puede tardar con miles de archivos."""
+    cluster = session.get(Cluster, person_id)
+    if not cluster:
+        raise HTTPException(404, "Person not found")
+    rows = (
+        session.query(File)
+        .join(Face, Face.file_id == File.id)
+        .filter(Face.cluster_id == person_id, File.archived == 0)
+        .distinct()
+        .order_by(File.id)
+        .all()
+    )
+    if not rows:
+        raise HTTPException(404, "No hay archivos para exportar")
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    label = (cluster.label or f"persona-{person_id}").replace("/", "-").replace("\\", "-")[:80]
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in rows:
+                p = Path(f.path)
+                if not p.is_file():
+                    continue
+                arc = f"{label}/{f.id}_{p.name}"
+                zf.write(p, arcname=arc)
+    except Exception:
+        if os.path.isfile(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+    def _unlink():
+        if os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    background_tasks.add_task(_unlink)
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label) or f"persona-{person_id}"
+    return FileResponse(
+        tmp_path,
+        filename=f"{safe}.zip",
+        media_type="application/zip",
+    )
 
 
 @router.post("/merge", response_model=ClusterOut)
@@ -517,5 +679,5 @@ def merge_people(body: MergeClustersIn, session: Session = Depends(get_session))
     target.size = session.query(Face).filter(Face.cluster_id == body.target_id).count()
     target.is_manual = 1  # merged by user = protected from re-clustering
     session.delete(source)
-    session.commit()
+    _commit_invalidate_centroids(session)
     return _cluster_to_out(target, session)

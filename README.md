@@ -5,7 +5,7 @@ Reconocimiento facial local para fotos y videos — alternativa a Google Photos 
 ## Uso rápido
 
 1. **Copia** tus fotos y videos en `data/photos/` (puedes usar subcarpetas: 2016, 2025, etc.)
-2. **Ejecuta** `index_and_cluster.bat` (o `index_and_cluster.bat "D:\Mis Fotos"` si están en otra ruta)
+2. **Ejecuta** `photos_db.bat` (o `index_and_cluster.bat`, hace lo mismo) — opcional: `photos_db.bat "D:\Mis Fotos"` o `photos_db.bat "D:\Mis Fotos" 4` para más workers
 3. **Inicia** la app con `start.bat` y abre **http://localhost:5892**
 
 📖 **Instrucciones completas en español:** [INSTRUCCIONES.md](INSTRUCCIONES.md)
@@ -15,8 +15,10 @@ Reconocimiento facial local para fotos y videos — alternativa a Google Photos 
 | Situación | Qué hacer |
 |-----------|-----------|
 | Mover proyecto completo, conservar indexado | `update_paths.bat "RUTA_VIEJA\data\photos" "RUTA_NUEVA\data\photos"` |
-| Pegar carpetas nuevas en data/photos | `index_and_cluster.bat` |
-| Empezar de cero | `reindex_all.bat` |
+| Pegar carpetas nuevas en data/photos | `photos_db.bat` (incremental) |
+| Empezar de cero (nueva BD + reindex) | `photos_db.bat recreate` |
+| Copia de seguridad de la BD sin reindexar | `photos_db.bat snapshot` |
+| SQLite dañado (`.recover`) | `photos_db.bat recover "entrada.db"` |
 
 ---
 
@@ -64,16 +66,31 @@ cd ..
 
 ## Scripts de Windows
 
+### `photos_db.bat` — base de datos e indexado (un solo script)
+
+| Comando | Qué hace |
+|---------|-----------|
+| `photos_db.bat` | **Por defecto:** indexado **incremental** (solo archivos nuevos o cambiados), luego **cluster** de rostros. Cierra procesos Python, mueve `wal/shm` viejos a `data/db_backup/wal_*` (no borra la BD). |
+| `photos_db.bat 4` | Igual con **4 workers** en paralelo. |
+| `photos_db.bat "D:\Fotos"` | Raíz de fotos distinta de `data/photos/`. |
+| `photos_db.bat "D:\Fotos" 4` | Raíz + workers. |
+| `photos_db.bat recreate` | **Mueve** `photos.db` + wal + shm a `data/db_backup/backup_<fecha>/` y crea una **BD nueva**; **reindexa todo** (`--force`) y vuelve a agrupar caras. |
+| `photos_db.bat recreate 4` / `recreate "Ruta" 4` | `recreate` con workers y/o carpeta. |
+| `photos_db.bat snapshot` | **Copia** la BD a `data/db_backup/snapshot_<fecha>/` sin reindexar (mejor con API cerrada). |
+| `photos_db.bat recover "mala.db"` | **SQLite `.recover`** → `data/photos_recovered.db`. |
+| `photos_db.bat recover "mala.db" "salida.db"` | Salida explícita. |
+| `photos_db.bat help` | Ayuda en consola. |
+
+`index_and_cluster.bat` es un **alias** de `photos_db.bat` (misma sintaxis que las cuatro primeras filas).
+
+### Otros `.bat`
+
 | Script | Descripción |
 |--------|-------------|
-| `setup.bat` | Primera vez: instala dependencias y crea carpetas |
-| `index_and_cluster.bat` | Indexa `data/photos/` y agrupa caras |
-| `index_and_cluster.bat "Ruta"` | Indexa desde otra carpeta |
-| `index_and_cluster.bat "Ruta" 4` | Con 4 workers en paralelo |
-| `start.bat` | Inicia API (8732) + frontend (5892) |
-| `stop.bat` | Detiene la aplicación |
-| `update_paths.bat "OLD" "NEW"` | Actualiza rutas tras mover a otro disco |
-| `reindex_all.bat` | Borra todo y reindexa desde cero |
+| `setup.bat` | Primera vez: `pip`, `npm`, carpetas, `.env` del frontend |
+| `start.bat` | API (8732) + frontend (5892) |
+| `stop.bat` | Cierra ventanas de la app |
+| `update_paths.bat "OLD" "NEW"` | Sustituye prefijo de rutas en la tabla `files` |
 
 ## AMD GPU Acceleration
 

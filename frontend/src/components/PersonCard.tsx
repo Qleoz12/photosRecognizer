@@ -1,3 +1,4 @@
+import type { MouseEvent } from "react";
 import { api, ClusterOut } from "../api";
 
 interface Props {
@@ -7,9 +8,21 @@ interface Props {
   selected?: boolean;
   /** 0–1 similarity score; shown as percentage when present */
   similarity?: number;
+  /** Ocultar del listado principal (icono en la tarjeta) */
+  onHide?: (e: MouseEvent) => void;
+  /** Volver a mostrar (sección personas ocultas) */
+  onRestore?: (e: MouseEvent) => void;
 }
 
-export default function PersonCard({ cluster, onClick, selectable, selected, similarity }: Props) {
+export default function PersonCard({
+  cluster,
+  onClick,
+  selectable,
+  selected,
+  similarity,
+  onHide,
+  onRestore,
+}: Props) {
   const thumb = api.thumbnailUrl(cluster.cover_thumbnail);
   const label = cluster.label ?? `Persona #${cluster.id}`;
 
@@ -25,6 +38,26 @@ export default function PersonCard({ cluster, onClick, selectable, selected, sim
         }`}
     >
       <div className="relative w-20 h-20 rounded-full overflow-hidden bg-gray-700 flex-shrink-0">
+        {onHide && !selectable && (
+          <button
+            type="button"
+            title="Ocultar del listado"
+            className="absolute top-0 right-0 z-10 rounded-bl-md bg-gray-950/85 p-1 text-gray-400 hover:text-amber-200 opacity-80 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
+            onClick={(e) => {
+              e.stopPropagation();
+              onHide(e);
+            }}
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"
+              />
+            </svg>
+          </button>
+        )}
         {thumb ? (
           <img
             src={thumb}
@@ -73,6 +106,18 @@ export default function PersonCard({ cluster, onClick, selectable, selected, sim
       )}
       {cluster.is_manual && (
         <span className="text-xs text-purple-400 font-medium">✓ confirmada</span>
+      )}
+      {onRestore && (
+        <button
+          type="button"
+          className="text-xs text-sky-400 hover:text-sky-300 font-medium"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRestore(e);
+          }}
+        >
+          Restaurar en listado
+        </button>
       )}
     </div>
   );

@@ -9,13 +9,23 @@ Puerta de enlace HTTP para SQLite bajo carga: varias instancias de solo lectura 
 Variables de entorno:
   READ_UPSTREAM   default http://127.0.0.1:18734
   WRITE_UPSTREAM  default http://127.0.0.1:18733
+  GATEWAY_SERIALIZE_WRITES  default 1 — cola global en el gateway para mutaciones (PATCH/POST/…)
+    hacia el único API escritor; evita ráfagas concurrentes sobre un solo proceso SQLite.
+
+No uses dos procesos Uvicorn «write» contra el mismo photos.db: SQLite solo serializa un escritor
+real; varios procesos generan locks y errores. Más lectores sí (API_READ_WORKERS).
 
 Limitación: índices en memoria (p. ej. /search/face) y centroides quedan por proceso; tras
 re-cluster en el escritor, los workers de lectura pueden servir datos viejos hasta que se
 reconstruya el índice en ese proceso (p. ej. reiniciar lectura o esperar TTL interno si existe).
+
+Ante cortes TCP intermitentes hacia el upstream (p. ej. httpx.ReadError al leer cabeceras),
+se reintenta una vez las peticiones idempotentes; el resto devuelve 502 si el upstream cae.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
@@ -29,6 +39,8 @@ from starlette.routing import Route
 
 READ_UPSTREAM = os.environ.get("READ_UPSTREAM", "http://127.0.0.1:18734").rstrip("/")
 WRITE_UPSTREAM = os.environ.get("WRITE_UPSTREAM", "http://127.0.0.1:18733").rstrip("/")
+
+logger = logging.getLogger(__name__)
 
 _HOP_BY_HOP = frozenset(
     {
@@ -71,6 +83,14 @@ def _upstream_for(method: str, path: str) -> str:
     return WRITE_UPSTREAM
 
 
+def _proxy_retryable(method: str, path: str) -> bool:
+    """Solo reintentar si es seguro repetir la petición (sin efectos duplicados)."""
+    m = method.upper()
+    if m in ("GET", "HEAD", "OPTIONS"):
+        return True
+    return m == "POST" and _is_read_safe_post(path)
+
+
 def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in headers.items():
@@ -80,33 +100,71 @@ def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return out
 
 
+def _gateway_serialize_writes() -> bool:
+    v = os.environ.get("GATEWAY_SERIALIZE_WRITES", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     timeout = httpx.Timeout(600.0, connect=30.0)
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    app.state.write_lock = asyncio.Lock()
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False) as client:
         app.state.http = client
         yield
 
 
-async def _proxy(request: Request) -> Response:
-    base = _upstream_for(request.method, request.url.path)
+async def _proxy_upstream(
+    request: Request,
+    base: str,
+    body: bytes,
+) -> Response:
     url = f"{base}{request.url.path}"
     q = request.url.query
     if q:
         url = f"{url}?{q}"
 
     hdrs = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
-    body = await request.body()
     client: httpx.AsyncClient = request.app.state.http
 
-    req = client.build_request(
-        request.method,
-        url,
-        headers=hdrs,
-        content=body if body else None,
-    )
-    resp = await client.send(req, stream=True)
+    max_attempts = 2 if _proxy_retryable(request.method, request.url.path) else 1
+    _RETRIABLE = (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError)
+    resp: httpx.Response | None = None
+    for attempt in range(max_attempts):
+        req = client.build_request(
+            request.method,
+            url,
+            headers=hdrs,
+            content=body if body else None,
+        )
+        try:
+            resp = await client.send(req, stream=True)
+            break
+        except _RETRIABLE as exc:
+            if attempt + 1 < max_attempts:
+                logger.warning(
+                    "gateway proxy retry %s %s (attempt %s/%s): %s",
+                    request.method,
+                    request.url.path,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+                continue
+            logger.error(
+                "gateway proxy upstream failed %s %s: %s",
+                request.method,
+                request.url.path,
+                exc,
+            )
+            return Response(
+                status_code=502,
+                content=b"Bad Gateway: upstream connection error",
+                media_type="text/plain",
+            )
+
+    assert resp is not None
 
     async def stream_body() -> AsyncIterator[bytes]:
         try:
@@ -120,6 +178,16 @@ async def _proxy(request: Request) -> Response:
         status_code=resp.status_code,
         headers=_filter_response_headers(resp.headers),
     )
+
+
+async def _proxy(request: Request) -> Response:
+    base = _upstream_for(request.method, request.url.path)
+    body = await request.body()
+
+    if _gateway_serialize_writes() and base == WRITE_UPSTREAM:
+        async with request.app.state.write_lock:
+            return await _proxy_upstream(request, base, body)
+    return await _proxy_upstream(request, base, body)
 
 
 routes = [

@@ -34,6 +34,10 @@ export default function Videos() {
   const [newMemoryLabel, setNewMemoryLabel] = useState("");
   const [newPersonLabel, setNewPersonLabel] = useState("");
   const [newAlbumLabel, setNewAlbumLabel] = useState("");
+  const [archiveConfigured, setArchiveConfigured] = useState(false);
+  const [lightboxArchiving, setLightboxArchiving] = useState(false);
+  const [archivingSelection, setArchivingSelection] = useState(false);
+  const [lightboxMediaLoading, setLightboxMediaLoading] = useState(true);
   const personMenuRef = useRef<HTMLDivElement>(null);
   const memoryMenuRef = useRef<HTMLDivElement>(null);
   const albumMenuRef = useRef<HTMLDivElement>(null);
@@ -41,10 +45,15 @@ export default function Videos() {
 
   const loadMore = async (pageNum: number) => {
     setLoading(true);
-    const data = await api.getVideos(pageNum * PAGE_SIZE, PAGE_SIZE);
-    if (data.length < PAGE_SIZE) setHasMore(false);
-    setVideos((prev) => (pageNum === 0 ? data : [...prev, ...data]));
-    setLoading(false);
+    try {
+      const data = await api.getVideos(pageNum * PAGE_SIZE, PAGE_SIZE);
+      if (data.length < PAGE_SIZE) setHasMore(false);
+      setVideos((prev) => (pageNum === 0 ? data : [...prev, ...data]));
+    } catch {
+      if (pageNum === 0) setVideos([]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -54,7 +63,12 @@ export default function Videos() {
   useEffect(() => {
     api.getMemories().then(setMemories);
     api.getAlbums().then(setAlbums);
+    api.getArchiveStatus().then((s) => setArchiveConfigured(s.configured)).catch(() => setArchiveConfigured(false));
   }, []);
+
+  useEffect(() => {
+    if (lightbox) setLightboxMediaLoading(true);
+  }, [lightbox?.id]);
 
   useEffect(() => {
     if (selectionMode) api.getPeople(0, 300).then(setAllPeople);
@@ -179,6 +193,40 @@ export default function Videos() {
   const years = Object.keys(byYear).sort((a, b) => b.localeCompare(a));
   const videosInOrder = years.flatMap((y) => byYear[y]);
 
+  const handleArchiveFromLightbox = async () => {
+    if (!lightbox || !archiveConfigured) return;
+    if (!confirm("¿Archivar este vídeo? Dejará de verse en la galería de vídeos.")) return;
+    setLightboxArchiving(true);
+    try {
+      await api.archiveFiles([lightbox.id]);
+      setVideos((prev) => prev.filter((v) => v.id !== lightbox.id));
+      setLightbox(null);
+    } catch (e) {
+      alert("No se pudo archivar: " + e);
+    } finally {
+      setLightboxArchiving(false);
+    }
+  };
+
+  const handleArchiveSelectedVideos = async () => {
+    const ids = Array.from(selectedVideos);
+    if (ids.length === 0 || !archiveConfigured) return;
+    if (!confirm(`¿Archivar ${ids.length} vídeo(s)? Dejarán de verse en esta lista.`)) return;
+    setArchivingSelection(true);
+    try {
+      await api.archiveFiles(ids);
+      setVideos((prev) => prev.filter((v) => !selectedVideos.has(v.id)));
+      setSelectedVideos(new Set());
+      setSelectionMode(false);
+      setAssignMenu(null);
+      lastSelectedIndexRef.current = null;
+    } catch (e) {
+      alert("No se pudo archivar: " + e);
+    } finally {
+      setArchivingSelection(false);
+    }
+  };
+
   const toggleSelectVideo = (fileId: number, index: number, e: React.MouseEvent) => {
     if (e.shiftKey) e.preventDefault();
     const shift = e.shiftKey;
@@ -293,6 +341,16 @@ export default function Videos() {
                   loading={addingToAlbum}
                 />
               </div>
+              {archiveConfigured && (
+                <button
+                  type="button"
+                  onClick={() => void handleArchiveSelectedVideos()}
+                  disabled={selectedVideos.size === 0 || archivingSelection}
+                  className="px-4 py-2 rounded-lg text-sm font-medium shrink-0 bg-stone-700 hover:bg-stone-600 text-stone-100 disabled:opacity-50"
+                >
+                  {archivingSelection ? "Archivando…" : "Archivar"}
+                </button>
+              )}
               <button
                 onClick={() => {
                   setSelectionMode(false);
@@ -369,22 +427,56 @@ export default function Videos() {
 
       {lightbox && (
         <div
-          className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 bg-black/90 z-50 flex flex-col p-0 sm:p-4 overflow-hidden"
           onClick={() => setLightbox(null)}
         >
           <div
-            className="max-w-5xl w-full"
+            className="max-w-5xl w-full mx-auto flex flex-col max-h-full flex-1 min-h-0"
             onClick={(e) => e.stopPropagation()}
           >
-            <video
-              src={api.originalUrl(lightbox.id)}
-              controls
-              preload="auto"
-              autoPlay
-              className="max-w-full max-h-[90vh] rounded-lg bg-black"
-            />
-            <div className="mt-4 text-center text-gray-400 text-sm">
-              {lightbox.path.split(/[/\\]/).pop()}
+            <div className="sticky top-0 z-20 flex flex-wrap items-center gap-2 px-3 py-3 bg-gray-950/95 border-b border-gray-800 shrink-0">
+              <span className="truncate flex-1 min-w-0 text-sm text-gray-100 font-medium" title={lightbox.path}>
+                {lightbox.path.split(/[/\\]/).pop()}
+              </span>
+              {archiveConfigured ? (
+                <button
+                  type="button"
+                  onClick={() => void handleArchiveFromLightbox()}
+                  disabled={lightboxArchiving}
+                  className="px-3 py-2 rounded-lg border border-stone-500 bg-stone-800 hover:bg-stone-700 text-stone-100 disabled:opacity-50 text-sm font-semibold shrink-0"
+                >
+                  {lightboxArchiving ? "…" : "Archivar"}
+                </button>
+              ) : (
+                <span className="text-xs text-amber-600/90 shrink-0" title="ARCHIVE_PIN en .env (7–8 dígitos)">
+                  Sin archivo (PIN API)
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => setLightbox(null)}
+                className="px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm shrink-0"
+              >
+                Cerrar
+              </button>
+            </div>
+            <div className="relative flex justify-center items-center flex-1 min-h-0 p-3 overflow-auto">
+              {lightboxMediaLoading && (
+                <div className="absolute inset-3 flex items-center justify-center z-10 bg-black/40 rounded-lg">
+                  <Spinner message="Cargando vídeo…" />
+                </div>
+              )}
+              <video
+                src={api.originalUrl(lightbox.id)}
+                controls
+                preload="metadata"
+                playsInline
+                onLoadedMetadata={() => setLightboxMediaLoading(false)}
+                onLoadedData={() => setLightboxMediaLoading(false)}
+                onCanPlay={() => setLightboxMediaLoading(false)}
+                onError={() => setLightboxMediaLoading(false)}
+                className="max-w-full max-h-[min(85vh,900px)] rounded-lg bg-black"
+              />
             </div>
           </div>
         </div>

@@ -1,13 +1,17 @@
-import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { useParams, useNavigate, Link } from "react-router-dom";
 import { api, ClusterOut, ClusterSimilarOut, FileOut, SearchResult } from "../api";
 import FaceCropSelector from "../components/FaceCropSelector";
 import PhotoCard from "../components/PhotoCard";
 import PersonCard from "../components/PersonCard";
 import Spinner from "../components/Spinner";
+import ShareLinkModal from "../components/ShareLinkModal";
 import { useInfiniteScroll } from "../hooks/useInfiniteScroll";
 
 const PAGE_SIZE = 100;
+/** Cuántas sugerencias de otros clusters pedimos (unión en lote solo entre las cargadas). */
+const SIMILAR_CLUSTERS_LIMIT = 100;
+const MERGE_THRESHOLD_CHOICES = [50, 55, 60, 65, 70, 75, 80, 85, 90, 95] as const;
 
 export default function PersonDetail() {
   const { id } = useParams<{ id: string }>();
@@ -23,6 +27,8 @@ export default function PersonDetail() {
   const [editing, setEditing] = useState(false);
   const [newLabel, setNewLabel] = useState("");
   const [merging, setMerging] = useState<number | null>(null);
+  const [mergingBulk, setMergingBulk] = useState(false);
+  const [similarMergeThresholdPct, setSimilarMergeThresholdPct] = useState(60);
   const [onlyClearFaces, setOnlyClearFaces] = useState(false);
   const [lightbox, setLightbox] = useState<FileOut | null>(null);
   const [lightboxIdx, setLightboxIdx] = useState<number>(0);
@@ -48,6 +54,7 @@ export default function PersonDetail() {
   const [coverUpdatedMsg, setCoverUpdatedMsg] = useState(false);
   const [removingFace, setRemovingFace] = useState<number | null>(null);
   const [settingCanonical, setSettingCanonical] = useState<number | null>(null);
+  const [restoringVisibility, setRestoringVisibility] = useState(false);
   const [dateMetadata, setDateMetadata] = useState<{
     file_modified: string | null;
     file_created: string | null;
@@ -61,21 +68,60 @@ export default function PersonDetail() {
   const [findingSimilar, setFindingSimilar] = useState(false);
   const [similarPoolCount, setSimilarPoolCount] = useState(0);
   const [similarFiles, setSimilarFiles] = useState<Record<number, FileOut>>({});
+  const [personSimilarMeta, setPersonSimilarMeta] = useState<{
+    pool_size: number;
+    skipped_already_in_person: number;
+    skipped_no_faces: number;
+  } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
 
   useEffect(() => {
-    Promise.all([
-      api.getPerson(personId),
-      api.getPersonPhotos(personId, 0, PAGE_SIZE),
-      api.getSimilarPeople(personId, 15, 0.5),
-    ])
-      .then(([p, ph, sim]) => {
+    if (!Number.isFinite(personId) || personId < 1) {
+      setLoading(false);
+      setPerson(null);
+      setLoadError("ID de persona no válido.");
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+
+    (async () => {
+      try {
+        const p = await api.getPerson(personId);
+        if (cancelled) return;
         setPerson(p);
         setNewLabel(p.label ?? "");
+        const [ph, sim] = await Promise.all([
+          api.getPersonPhotos(personId, 0, PAGE_SIZE).catch((err) => {
+            console.warn("getPersonPhotos:", err);
+            return [] as FileOut[];
+          }),
+          api.getSimilarPeople(personId, SIMILAR_CLUSTERS_LIMIT, 0.5).catch((err) => {
+            console.warn("getSimilarPeople:", err);
+            return [] as ClusterSimilarOut[];
+          }),
+        ]);
+        if (cancelled) return;
         setFiles(ph);
         setHasMore(ph.length === PAGE_SIZE);
         setSimilar(sim);
-      })
-      .finally(() => setLoading(false));
+      } catch (e) {
+        if (cancelled) return;
+        setPerson(null);
+        setFiles([]);
+        setSimilar([]);
+        setLoadError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [personId]);
 
   // Zoom con scroll en lightbox (passive: false para preventDefault)
@@ -167,6 +213,7 @@ export default function PersonDetail() {
     setSimilarResults([]);
     setSimilarPoolCount(0);
     setSimilarFiles({});
+    setPersonSimilarMeta(null);
     try {
       const pool: number[] = [];
       const poolFiles: Record<number, FileOut> = {};
@@ -184,21 +231,31 @@ export default function PersonDetail() {
         setSimilarPoolCount(pool.length);
         if (batch.length < BATCH) break;
       }
-      const results = await api.findSimilarPersonInPage(personId, pool);
-      setSimilarResults(results);
+      const data = await api.findSimilarPersonInPage(personId, pool);
+      setSimilarResults(data.results);
+      setSimilarPoolCount(data.pool_size);
+      const ids = data.results.map((r) => r.file_id);
       const byId: Record<number, FileOut> = {};
-      for (const r of results) {
-        if (poolFiles[r.file_id]) byId[r.file_id] = poolFiles[r.file_id];
-        else {
-          try {
-            const f = await api.getPhoto(r.file_id);
-            byId[r.file_id] = f;
-          } catch {
-            /* ignorar */
-          }
-        }
+      const CHUNK = 24;
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const slice = ids.slice(i, i + CHUNK);
+        const loaded = await Promise.all(
+          slice.map((id) =>
+            poolFiles[id]
+              ? Promise.resolve(poolFiles[id])
+              : api.getPhoto(id).catch(() => null)
+          )
+        );
+        slice.forEach((id, j) => {
+          if (loaded[j]) byId[id] = loaded[j] as FileOut;
+        });
       }
       setSimilarFiles(byId);
+      setPersonSimilarMeta({
+        pool_size: data.pool_size,
+        skipped_already_in_person: data.skipped_already_in_person,
+        skipped_no_faces: data.skipped_no_faces,
+      });
     } catch (e) {
       alert("Error: " + e);
     } finally {
@@ -229,10 +286,51 @@ export default function PersonDetail() {
       setPerson(merged);
       setSimilar((prev) => prev.filter((s) => s.id !== sourceId));
       // Recargar personas similares (el centroide cambió al fusionar)
-      const sim = await api.getSimilarPeople(personId, 15, 0.5);
+      const sim = await api.getSimilarPeople(personId, SIMILAR_CLUSTERS_LIMIT, 0.5);
       setSimilar(sim);
     } finally {
       setMerging(null);
+    }
+  };
+
+  const minSimilarityForBulk = similarMergeThresholdPct / 100;
+  const similarAboveThreshold = useMemo(
+    () => similar.filter((s) => s.similarity >= minSimilarityForBulk),
+    [similar, minSimilarityForBulk],
+  );
+
+  const handleMergeAllAboveThreshold = async () => {
+    if (!person) return;
+    const targets = similarAboveThreshold.filter((s) => s.id !== person.id);
+    if (targets.length === 0) {
+      alert("Ninguna persona en la lista cumple el umbral.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `¿Unir ${targets.length} persona(s) en «${person.label ?? `Persona #${person.id}`}»?\n` +
+          `Solo las tarjetas mostradas aquí con parecido ≥ ${similarMergeThresholdPct}%.`,
+      )
+    ) {
+      return;
+    }
+    setMergingBulk(true);
+    try {
+      for (const s of [...targets].sort((a, b) => b.similarity - a.similarity)) {
+        await api.mergePeople(s.id, person.id);
+      }
+      const [updated, sim, newFiles] = await Promise.all([
+        api.getPerson(personId),
+        api.getSimilarPeople(personId, SIMILAR_CLUSTERS_LIMIT, 0.5),
+        api.getPersonPhotos(personId, 0, Math.max(files.length, PAGE_SIZE)),
+      ]);
+      setPerson(updated);
+      setSimilar(sim);
+      setFiles(newFiles);
+    } catch (e) {
+      alert("Error al unir en lote: " + e);
+    } finally {
+      setMergingBulk(false);
     }
   };
 
@@ -335,7 +433,7 @@ export default function PersonDetail() {
       await api.assignFaceToPerson(targetPersonId, faceId);
       const [updated, sim, newFiles] = await Promise.all([
         api.getPerson(personId),
-        api.getSimilarPeople(personId, 15, 0.5),
+        api.getSimilarPeople(personId, SIMILAR_CLUSTERS_LIMIT, 0.5),
         api.getPersonPhotos(personId, 0, Math.max(files.length, PAGE_SIZE)),
       ]);
       setPerson(updated);
@@ -407,7 +505,7 @@ export default function PersonDetail() {
       // Recargar datos: la foto debe aparecer en todas las galerías asignadas
       const [updated, sim, newFiles] = await Promise.all([
         api.getPerson(personId),
-        api.getSimilarPeople(personId, 15, 0.5),
+        api.getSimilarPeople(personId, SIMILAR_CLUSTERS_LIMIT, 0.5),
         api.getPersonPhotos(personId, 0, Math.max(files.length, PAGE_SIZE)),
       ]);
       setPerson(updated);
@@ -477,7 +575,37 @@ export default function PersonDetail() {
   };
 
   if (loading) return <Spinner message="Cargando persona..." />;
-  if (!person) return <p className="p-6 text-red-400">Persona no encontrada.</p>;
+  if (!person) {
+    const is404 =
+      loadError?.includes("404") ||
+      loadError?.includes("Person not found") ||
+      loadError?.includes("no encontrad");
+    return (
+      <div className="p-6 max-w-lg">
+        <p className="text-red-400 mb-2">
+          {is404 ? "Persona no encontrada." : loadError ?? "No se pudo cargar la persona."}
+        </p>
+        {!is404 && loadError && (
+          <p className="text-sm text-gray-500 mb-4">
+            Si la ficha existe, puede ser un fallo puntual de la API (p. ej. similares). Recarga la página o revisa que
+            el servidor FastAPI esté en marcha y VITE_API_URL sea correcto.
+          </p>
+        )}
+        {is404 && (
+          <p className="text-sm text-gray-500 mb-4">
+            Puede haberse fusionado con otra persona, haberse borrado al quedar sin caras, o el enlace ser antiguo.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => navigate("/")}
+          className="text-sm px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-white"
+        >
+          Volver a Personas
+        </button>
+      </div>
+    );
+  }
 
   const videos = files.filter((f) => f.file_type === "video");
 
@@ -509,6 +637,36 @@ export default function PersonDetail() {
       {coverUpdatedMsg && (
         <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-green-600 text-white text-sm font-medium shadow-lg">
           ✓ Foto de perfil actualizada
+        </div>
+      )}
+
+      {shareModalOpen && (
+        <ShareLinkModal personIds={[personId]} onClose={() => setShareModalOpen(false)} />
+      )}
+
+      {person.is_hidden && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-900/50 bg-amber-950/35 px-4 py-3 text-sm text-amber-100/95">
+          <p className="min-w-0 flex-1">
+            Esta persona está <strong>oculta</strong>: no sale en la cuadrícula principal de Personas ni en sugerencias de búsqueda por rostro.
+          </p>
+          <button
+            type="button"
+            disabled={restoringVisibility}
+            onClick={async () => {
+              setRestoringVisibility(true);
+              try {
+                const u = await api.updatePerson(personId, { is_hidden: false });
+                setPerson(u);
+              } catch (e) {
+                alert("Error: " + e);
+              } finally {
+                setRestoringVisibility(false);
+              }
+            }}
+            className="shrink-0 rounded-lg bg-sky-700 px-3 py-1.5 text-white text-sm hover:bg-sky-600 disabled:opacity-50"
+          >
+            {restoringVisibility ? "…" : "Mostrar en Personas"}
+          </button>
         </div>
       )}
 
@@ -581,7 +739,7 @@ export default function PersonDetail() {
             {" · "}mostrando {files.length.toLocaleString()}
             {videos.length > 0 && ` · ${videos.length} video${videos.length !== 1 ? "s" : ""}`}
           </p>
-          <div className="mt-3 flex flex-wrap gap-2">
+          <div className="mt-3 flex flex-wrap gap-2 items-center">
             <button
               type="button"
               onClick={handleFindSimilarHere}
@@ -589,6 +747,21 @@ export default function PersonDetail() {
               className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium"
             >
               {findingSimilar ? "Buscando..." : "Buscar similares aquí"}
+            </button>
+            <a
+              href={api.personDownloadZipUrl(personId)}
+              download
+              className="px-4 py-2 rounded-lg bg-emerald-800 hover:bg-emerald-700 text-white text-sm font-medium border border-emerald-700"
+              title="Puede tardar si hay miles de archivos"
+            >
+              Descargar todo (ZIP)
+            </a>
+            <button
+              type="button"
+              onClick={() => setShareModalOpen(true)}
+              className="px-4 py-2 rounded-lg bg-sky-800 hover:bg-sky-700 text-white text-sm font-medium border border-sky-700"
+            >
+              Compartir enlace…
             </button>
             <span className="text-xs text-gray-500 self-center max-w-md">
               Busca entre las primeras ~10 000 fotos. Las sugerencias aparecen aquí (no te envía a la galería).
@@ -705,9 +878,18 @@ export default function PersonDetail() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="p-4 border-b border-gray-700 flex items-center justify-between shrink-0">
-              <h2 className="text-lg font-semibold text-white">
-                Similares a la persona — busca en {similarPoolCount.toLocaleString()} fotos cargadas
-              </h2>
+              <div>
+                <h2 className="text-lg font-semibold text-white">
+                  Similares a la persona — busca en {similarPoolCount.toLocaleString()} fotos cargadas
+                </h2>
+                {personSimilarMeta && !findingSimilar && (
+                  <p className="text-sm text-gray-400 mt-1">
+                    Pool: {personSimilarMeta.pool_size.toLocaleString()} · Ya en la persona:{" "}
+                    {personSimilarMeta.skipped_already_in_person.toLocaleString()} · Sin rostro comparable:{" "}
+                    {personSimilarMeta.skipped_no_faces.toLocaleString()}
+                  </p>
+                )}
+              </div>
               <button
                 onClick={() => setSimilarModalOpen(false)}
                 className="text-gray-400 hover:text-white text-2xl"
@@ -718,7 +900,13 @@ export default function PersonDetail() {
             <div className="p-4 overflow-auto flex-1">
               {findingSimilar ? (
                 <div className="flex flex-col items-center justify-center py-16 text-gray-400">
-                  <Spinner message={`Cargando pool (${similarPoolCount.toLocaleString()} fotos) y buscando...`} />
+                  <Spinner
+                    message={
+                      similarPoolCount > 0
+                        ? `Construyendo pool (${similarPoolCount.toLocaleString()} candidatas)… luego comparación en servidor`
+                        : "Cargando candidatas…"
+                    }
+                  />
                 </div>
               ) : similarResults.length === 0 ? (
                 <div className="text-center py-16 text-gray-400">
@@ -756,29 +944,70 @@ export default function PersonDetail() {
       {/* Personas similares — ordenadas por parecido para validar merges */}
       {similar.length > 0 && (
         <div className="mb-10">
-          <h2 className="text-lg font-semibold text-gray-300 mb-3 border-b border-gray-800 pb-2">
+          <h2 className="text-lg font-semibold text-gray-300 mb-2 border-b border-gray-800 pb-2">
             Personas similares
             <span className="text-sm font-normal text-gray-500 ml-2">
-              (posibles duplicados — ordenadas por parecido)
+              (posibles duplicados — ordenadas por parecido; hasta {SIMILAR_CLUSTERS_LIMIT} sugerencias)
             </span>
           </h2>
+          <div className="mb-4 flex flex-wrap items-center gap-3 text-sm">
+            <label className="flex items-center gap-2 text-gray-400">
+              Umbral unión en lote
+              <select
+                value={similarMergeThresholdPct}
+                onChange={(e) => setSimilarMergeThresholdPct(Number(e.target.value))}
+                disabled={mergingBulk || merging !== null}
+                className="bg-gray-800 border border-gray-600 rounded-lg px-2 py-1.5 text-white disabled:opacity-50"
+              >
+                {MERGE_THRESHOLD_CHOICES.map((p) => (
+                  <option key={p} value={p}>
+                    {p}%
+                  </option>
+                ))}
+              </select>
+            </label>
+            <span className="text-gray-500">
+              <span className="text-amber-200/90 font-medium tabular-nums">{similarAboveThreshold.length}</span> de{" "}
+              {similar.length} en pantalla cumplen ≥ {similarMergeThresholdPct}%
+            </span>
+            <button
+              type="button"
+              disabled={mergingBulk || merging !== null || similarAboveThreshold.length === 0}
+              onClick={handleMergeAllAboveThreshold}
+              className="px-3 py-1.5 rounded-lg bg-amber-700 hover:bg-amber-600 disabled:opacity-40 text-white text-sm font-medium"
+            >
+              {mergingBulk ? "Uniendo…" : `Unir todas ≥ ${similarMergeThresholdPct}%`}
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mb-3">
+            Revisa las tarjetas: las que entran en el lote llevan borde ámbar. La unión masiva solo afecta a las listadas
+            aquí (no a toda la biblioteca).
+          </p>
           <div className="flex flex-wrap gap-4">
-            {similar.map((s) => (
-              <div key={s.id} className="flex flex-col items-center gap-2">
-                <PersonCard
-                  cluster={s}
-                  similarity={s.similarity}
-                  onClick={() => navigate(`/person/${s.id}`)}
-                />
-                <button
-                  onClick={() => handleMerge(s.id)}
-                  disabled={merging === s.id}
-                  className="px-3 py-1 text-xs rounded-lg bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white"
+            {similar.map((s) => {
+              const inBulk = s.similarity >= minSimilarityForBulk;
+              return (
+                <div
+                  key={s.id}
+                  className={`flex flex-col items-center gap-2 rounded-xl p-1 transition-colors ${
+                    inBulk ? "ring-2 ring-amber-500/55 bg-amber-950/25" : "ring-1 ring-transparent"
+                  }`}
                 >
-                  {merging === s.id ? "Uniendo..." : "Unir aquí"}
-                </button>
-              </div>
-            ))}
+                  <PersonCard
+                    cluster={s}
+                    similarity={s.similarity}
+                    onClick={() => navigate(`/person/${s.id}`)}
+                  />
+                  <button
+                    onClick={() => handleMerge(s.id)}
+                    disabled={merging === s.id || mergingBulk}
+                    className="px-3 py-1 text-xs rounded-lg bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white"
+                  >
+                    {merging === s.id ? "Uniendo..." : "Unir aquí"}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -930,7 +1159,8 @@ export default function PersonDetail() {
                     .reduce((acc: SearchResult[], r) => {
                       if (!acc.some((x) => x.cluster_id === r.cluster_id)) acc.push(r);
                       return acc;
-                    }, []);
+                    }, [])
+                    .filter((r) => r.cluster_id !== personId);
                   return (
                     <div
                       key={faceIdx}
@@ -945,28 +1175,70 @@ export default function PersonDetail() {
                         <span className="text-sm text-gray-400">
                           Rostro {faceIdx + 1} ({Math.round(face.det_score * 100)}%)
                         </span>
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            onClick={() => handleAddFaceToCluster(personId, face.bbox, faceIdx, face)}
-                            disabled={addingFace?.faceIdx === faceIdx && addingFace?.clusterId === personId}
-                            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-sm"
-                          >
-                            {addingFace?.faceIdx === faceIdx && addingFace?.clusterId === personId
-                              ? "..."
-                              : `Agregar a ${person?.label ?? `Persona #${personId}`}`}
-                          </button>
-                          {suggestions.map((r) => (
-                            <button
-                              key={r.cluster_id!}
-                              onClick={() => handleAddFaceToCluster(r.cluster_id!, face.bbox, faceIdx, face)}
-                              disabled={addingFace?.faceIdx === faceIdx && addingFace?.clusterId === r.cluster_id}
-                              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-sm"
-                            >
-                              {addingFace?.faceIdx === faceIdx && addingFace?.clusterId === r.cluster_id
-                                ? "..."
-                                : `Persona #${r.cluster_id} (${Math.round(r.similarity * 100)}%)`}
-                            </button>
-                          ))}
+                        <div className="flex flex-col gap-2">
+                          <div className="flex flex-wrap items-center gap-2 py-1.5 px-2 rounded-lg bg-gray-900/70 border border-blue-700/50">
+                            <span className="text-sm text-gray-200 min-w-0 flex-1">
+                              {person?.label ?? `Persona #${personId}`}{" "}
+                              <span className="text-blue-400 font-medium">(esta persona)</span>
+                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <Link
+                                to={`/person/${personId}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-2.5 py-1 rounded-md bg-gray-700 hover:bg-gray-600 text-xs font-semibold text-gray-100 border border-gray-500/80"
+                              >
+                                Ver
+                              </Link>
+                              <button
+                                type="button"
+                                onClick={() => handleAddFaceToCluster(personId, face.bbox, faceIdx, face)}
+                                disabled={addingFace?.faceIdx === faceIdx && addingFace?.clusterId === personId}
+                                className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-semibold text-white"
+                              >
+                                {addingFace?.faceIdx === faceIdx && addingFace?.clusterId === personId ? "…" : "Agregar"}
+                              </button>
+                            </div>
+                          </div>
+                          {suggestions.map((r) => {
+                            const cid = r.cluster_id!;
+                            const busy = addingFace?.faceIdx === faceIdx && addingFace?.clusterId === cid;
+                            const sugLabel =
+                              (cid === person?.id ? person?.label : null) ??
+                              allPeople.find((p) => p.id === cid)?.label ??
+                              `Persona #${cid}`;
+                            return (
+                              <div
+                                key={cid}
+                                className="flex flex-wrap items-center gap-2 py-1.5 px-2 rounded-lg bg-gray-900/70 border border-gray-600/80"
+                              >
+                                <span className="text-sm text-gray-200 min-w-0 flex-1">
+                                  {sugLabel}{" "}
+                                  <span className="text-amber-400 font-medium">
+                                    ({Math.round(r.similarity * 100)}%)
+                                  </span>
+                                </span>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <Link
+                                    to={`/person/${cid}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="px-2.5 py-1 rounded-md bg-gray-700 hover:bg-gray-600 text-xs font-semibold text-gray-100 border border-gray-500/80"
+                                  >
+                                    Ver
+                                  </Link>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAddFaceToCluster(cid, face.bbox, faceIdx, face)}
+                                    disabled={busy}
+                                    className="px-2.5 py-1 rounded-md bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-xs font-semibold text-white"
+                                  >
+                                    {busy ? "…" : "Agregar"}
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>

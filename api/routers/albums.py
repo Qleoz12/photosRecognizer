@@ -21,7 +21,7 @@ def _get_album_lock(album_id: int) -> threading.Lock:
             _find_similar_locks[album_id] = threading.Lock()
         return _find_similar_locks[album_id]
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,9 @@ from indexer.db import bytes_to_embedding
 from indexer.clip_cache import get_or_compute_file_embedding
 
 router = APIRouter(prefix="/albums", tags=["albums"])
+
+# Tope de candidatos en "toda la biblioteca" (evita cargar cientos de miles de ids en RAM y bloquear SQLite).
+MAX_POOL_LIBRARY = 12_000
 
 
 class AlbumOut(BaseModel):
@@ -60,7 +63,7 @@ class FindSimilarIn(BaseModel):
     """File IDs cargados en la página para buscar similares sin reindexar."""
     file_ids: List[int]
     force_clip: bool = False
-    max_new: int = 1000
+    max_new: int = Field(default=500, ge=0, le=1000)  # default más bajo; clientes pueden subir hasta 1000
     exclude_faces_from_centroid: bool = False  # Solo fotos sin caras para centroide (documentos puros)
 
 
@@ -79,6 +82,41 @@ class CacheStatusIn(BaseModel):
     status: str  # "positive" | "negative"
 
 
+class CacheBatchStatusIn(BaseModel):
+    """Marcar muchas fotos del cache a la vez (misma operación que PATCH por file_id)."""
+    file_ids: List[int]
+    status: str  # "positive" | "negative"
+
+
+def _apply_cache_manual_status_batch(
+    album_id: int, body: CacheBatchStatusIn, session: Session
+) -> dict:
+    """Lógica compartida por POST .../search-cache y POST .../search-cache/batch."""
+    if body.status not in ("positive", "negative"):
+        raise HTTPException(400, "status debe ser positive o negative")
+    ids = [int(x) for x in body.file_ids if x is not None]
+    if not ids:
+        return {"updated": 0, "file_ids": []}
+    if len(ids) > 500:
+        raise HTTPException(400, "Máximo 500 file_ids por petición")
+    a = session.get(Album, album_id)
+    if not a:
+        raise HTTPException(404, "Album not found")
+    manual = 1 if body.status == "positive" else 0
+    updated: List[int] = []
+    for fid in ids:
+        row = (
+            session.query(AlbumSearchCache)
+            .filter_by(album_id=album_id, file_id=fid)
+            .first()
+        )
+        if row:
+            row.manual_status = manual
+            updated.append(fid)
+    session.commit()
+    return {"updated": len(updated), "file_ids": updated, "status": body.status}
+
+
 class SimilarResult(BaseModel):
     file_id: int
     similarity: float
@@ -90,6 +128,9 @@ class FindSimilarOut(BaseModel):
     sample_file_ids: List[int] = []  # file_ids usados para el centroide (como Persona muestra rostros)
     cached_count: int = 0
     computed_count: int = 0
+    pool_size: int = 0  # candidatos en este request (excl. álbum)
+    uncached_remaining_after: int = 0  # sin CLIP aún en el pool tras este batch
+    total_cached_album: int = 0  # filas en album_search_cache (toda la biblioteca ya clasificada p/este álbum)
     results: List[SimilarResult]
 
 
@@ -236,6 +277,16 @@ def set_cache_manual_status(
     return {"status": body.status, "file_id": file_id}
 
 
+@router.post("/{album_id}/search-cache/batch")
+def set_cache_manual_status_batch(
+    album_id: int,
+    body: CacheBatchStatusIn,
+    session: Session = Depends(get_session),
+):
+    """Marcar varias filas del cache (p. ej. sugeridas) como positivas o negativas en un solo commit."""
+    return _apply_cache_manual_status_batch(album_id, body, session)
+
+
 @router.delete("/{album_id}/search-cache")
 def delete_album_search_cache(album_id: int, session: Session = Depends(get_session)):
     """Borra todo el cache find-similar del álbum. Próxima búsqueda recalculará desde cero."""
@@ -245,6 +296,19 @@ def delete_album_search_cache(album_id: int, session: Session = Depends(get_sess
     deleted = session.query(AlbumSearchCache).filter(AlbumSearchCache.album_id == album_id).delete()
     session.commit()
     return {"deleted": deleted}
+
+
+@router.post("/{album_id}/search-cache")
+def set_cache_manual_status_batch_on_resource(
+    album_id: int,
+    body: CacheBatchStatusIn,
+    session: Session = Depends(get_session),
+):
+    """
+    Misma operación que POST .../search-cache/batch. URL canónica junto a GET/DELETE del recurso,
+    para evitar 405 si algún proxy o cliente antiguo no llega al sufijo /batch.
+    """
+    return _apply_cache_manual_status_batch(album_id, body, session)
 
 
 @router.patch("/{album_id}", response_model=AlbumOut)
@@ -271,21 +335,32 @@ def add_files_to_album(
     session: Session = Depends(get_session),
 ):
     """Add files to an album."""
-    a = session.get(Album, album_id)
-    if not a:
-        raise HTTPException(404, "Album not found")
-    max_so = session.query(func.max(AlbumFile.sort_order)).filter_by(album_id=album_id).scalar()
-    next_i = (max_so if max_so is not None else -1) + 1
-    for fid in body.file_ids:
-        f = session.get(FileModel, fid)
-        if not f:
-            continue
-        existing = session.query(AlbumFile).filter_by(album_id=album_id, file_id=fid).first()
-        if not existing:
-            session.add(AlbumFile(album_id=album_id, file_id=fid, sort_order=next_i, use_in_centroid=1))
-            next_i += 1
-    session.commit()
-    _recalculate_album_cache_scores(album_id, session)
+    # Un solo hilo por álbum + sin autoflush en el bucle: evita N flushes (INSERT) durante session.get,
+    # que disparaban "database is locked" con SQLite bajo carga o indexación en paralelo.
+    with _get_album_lock(album_id):
+        a = session.get(Album, album_id)
+        if not a:
+            raise HTTPException(404, "Album not found")
+        max_so = session.query(func.max(AlbumFile.sort_order)).filter_by(album_id=album_id).scalar()
+        next_i = (max_so if max_so is not None else -1) + 1
+        pending_new: set[int] = set()
+        with session.no_autoflush:
+            for fid in body.file_ids:
+                f = session.get(FileModel, fid)
+                if not f:
+                    continue
+                if fid in pending_new:
+                    continue
+                existing = session.query(AlbumFile).filter_by(album_id=album_id, file_id=fid).first()
+                if existing:
+                    continue
+                session.add(
+                    AlbumFile(album_id=album_id, file_id=fid, sort_order=next_i, use_in_centroid=1)
+                )
+                pending_new.add(fid)
+                next_i += 1
+        session.commit()
+        _recalculate_album_cache_scores(album_id, session)
     return {"status": "ok"}
 
 
@@ -297,15 +372,16 @@ def set_album_file_use_in_centroid(
     session: Session = Depends(get_session),
 ):
     """Incluir o excluir una foto del centroide (como Excluir en Persona). Recalcula scores sin borrar cache."""
-    a = session.get(Album, album_id)
-    if not a:
-        raise HTTPException(404, "Album not found")
-    af = session.query(AlbumFile).filter_by(album_id=album_id, file_id=file_id).first()
-    if not af:
-        raise HTTPException(404, "File not in album")
-    af.use_in_centroid = 1 if body.use_in_centroid else 0
-    session.commit()
-    _recalculate_album_cache_scores(album_id, session)
+    with _get_album_lock(album_id):
+        a = session.get(Album, album_id)
+        if not a:
+            raise HTTPException(404, "Album not found")
+        af = session.query(AlbumFile).filter_by(album_id=album_id, file_id=file_id).first()
+        if not af:
+            raise HTTPException(404, "File not in album")
+        af.use_in_centroid = 1 if body.use_in_centroid else 0
+        session.commit()
+        _recalculate_album_cache_scores(album_id, session)
     return {"status": "ok", "use_in_centroid": body.use_in_centroid}
 
 
@@ -316,11 +392,12 @@ def remove_file_from_album(
     session: Session = Depends(get_session),
 ):
     """Remove a file from an album."""
-    af = session.query(AlbumFile).filter_by(album_id=album_id, file_id=file_id).first()
-    if af:
-        session.delete(af)
-        session.commit()
-        _recalculate_album_cache_scores(album_id, session)
+    with _get_album_lock(album_id):
+        af = session.query(AlbumFile).filter_by(album_id=album_id, file_id=file_id).first()
+        if af:
+            session.delete(af)
+            session.commit()
+            _recalculate_album_cache_scores(album_id, session)
     return {"status": "ok"}
 
 
@@ -369,7 +446,7 @@ def get_album_photos(album_id: int, session: Session = Depends(get_session)):
     files = []
     for af in afs:
         f = session.get(FileModel, af.file_id)
-        if f:
+        if f and getattr(f, "archived", 0) == 0:
             files.append(AlbumPhotoOut(
                 id=f.id,
                 path=f.path,
@@ -382,6 +459,7 @@ def get_album_photos(album_id: int, session: Session = Depends(get_session)):
                 height=f.height,
                 duration=getattr(f, "duration", None),
                 faces=[],
+                archived=False,
                 use_in_centroid=bool(getattr(af, "use_in_centroid", 1)),
             ))
     return files
@@ -444,7 +522,10 @@ def _find_similar_impl(
     album_file_ids = [af.file_id for af in afs]
     centroid_afs = [af for af in afs if getattr(af, "use_in_centroid", 1) == 1]
     if not album_file_ids:
-        return FindSimilarOut(use_clip=False, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0, results=[])
+        return FindSimilarOut(
+            use_clip=False, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0,
+            pool_size=0, uncached_remaining_after=0, total_cached_album=0, results=[],
+        )
 
     use_clip = bool(body.force_clip)
     album_embeddings: List[np.ndarray] = []
@@ -484,7 +565,10 @@ def _find_similar_impl(
                 sample_file_ids.append(fid)
 
     if not album_embeddings:
-        return FindSimilarOut(use_clip=use_clip, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0, results=[])
+        return FindSimilarOut(
+            use_clip=use_clip, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0,
+            pool_size=0, uncached_remaining_after=0, total_cached_album=0, results=[],
+        )
 
     centroid = np.stack(album_embeddings).mean(axis=0).astype(np.float32)
     centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
@@ -549,12 +633,17 @@ def _find_similar_impl(
         session.commit()
 
         cached_count = len(cached_ids)
+        uncached_remaining_after = max(0, len(uncached_ids) - computed_count)
+        total_cached_album = session.query(AlbumSearchCache).filter_by(album_id=album_id).count()
         log.info("[find-similar] album_id=%s: listo. cache=%s computadas=%s resultados=%s", album_id, cached_count, computed_count, len(results))
         results.sort(key=lambda x: x.similarity, reverse=True)
         return FindSimilarOut(
             use_clip=True, sample_count=len(album_embeddings),
             sample_file_ids=sample_file_ids,
             cached_count=cached_count, computed_count=computed_count,
+            pool_size=len(pool_ids),
+            uncached_remaining_after=uncached_remaining_after,
+            total_cached_album=total_cached_album,
             results=results[:50],
         )
 
@@ -580,7 +669,11 @@ def _find_similar_impl(
             seen.add(fid)
 
     results.sort(key=lambda x: x.similarity, reverse=True)
-    return FindSimilarOut(use_clip=False, sample_count=len(album_embeddings), sample_file_ids=sample_file_ids, cached_count=0, computed_count=0, results=results[:50])
+    return FindSimilarOut(
+        use_clip=False, sample_count=len(album_embeddings), sample_file_ids=sample_file_ids,
+        cached_count=0, computed_count=0, pool_size=len(pool_ids),
+        uncached_remaining_after=0, total_cached_album=0, results=results[:50],
+    )
 
 
 @router.post("/{album_id}/find-similar-library", response_model=FindSimilarOut)
@@ -607,14 +700,15 @@ def find_similar_library(
         .all()
     ]
     if not album_file_ids:
-        return FindSimilarOut(use_clip=False, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0, results=[])
+        return FindSimilarOut(
+            use_clip=False, sample_count=0, sample_file_ids=[], cached_count=0, computed_count=0,
+            pool_size=0, uncached_remaining_after=0, total_cached_album=0, results=[],
+        )
 
-    album_ids_set = set(album_file_ids)
-    pool_ids = [
-        r[0]
-        for r in session.query(FileModel.id).filter(FileModel.file_type == "photo").all()
-        if r[0] not in album_ids_set
-    ]
+    pq = session.query(FileModel.id).filter(FileModel.file_type == "photo").filter(FileModel.archived == 0)
+    if album_file_ids:
+        pq = pq.filter(~FileModel.id.in_(album_file_ids))
+    pool_ids = [r[0] for r in pq.order_by(FileModel.id.asc()).limit(MAX_POOL_LIBRARY).all()]
     body = FindSimilarIn(
         file_ids=pool_ids,
         force_clip=force_clip,

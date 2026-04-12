@@ -36,6 +36,7 @@ class FileOut(BaseModel):
     height: Optional[int]
     duration: Optional[float] = None  # seconds, for videos
     faces: List[FaceOut] = []
+    archived: bool = False
 
     class Config:
         from_attributes = True
@@ -46,6 +47,20 @@ class FileUpdateIn(BaseModel):
     exif_date: Optional[datetime] = None
 
 
+class ArchiveIdsIn(BaseModel):
+    file_ids: List[int]
+
+
+class BulkExifYearIn(BaseModel):
+    """Asignar el mismo año (fecha EXIF interna: 1 jul mediodía) a varios archivos."""
+    file_ids: List[int]
+    year: int
+
+
+class PinVerifyIn(BaseModel):
+    pin: str
+
+
 class ClusterOut(BaseModel):
     id: int
     label: Optional[str]
@@ -53,6 +68,7 @@ class ClusterOut(BaseModel):
     cover_face_id: Optional[int]
     cover_thumbnail: Optional[str] = None  # injected by route
     is_manual: bool = False  # True = protected from auto re-clustering
+    is_hidden: bool = False  # True = no aparece en listado principal
 
     class Config:
         from_attributes = True
@@ -66,6 +82,7 @@ class ClusterSimilarOut(ClusterOut):
 class ClusterUpdateIn(BaseModel):
     label: Optional[str] = None
     cover_face_id: Optional[int] = None
+    is_hidden: Optional[bool] = None
 
 
 class MergeClustersIn(BaseModel):

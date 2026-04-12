@@ -1,0 +1,12 @@
+# Un solo agente ngrok con 2 tuneles HTTP (plan gratis = 1 agente, no 2 ventanas).
+# Ajusta addr si Vite o el API usan otros puertos.
+# El authtoken NO va aqui: usalo con ngrok_add_authtoken.bat (queda en %LOCALAPPDATA%\ngrok\ngrok.yml).
+
+version: "2"
+tunnels:
+  photos_web:
+    proto: http
+    addr: 5892
+  photos_api:
+    proto: http
+    addr: 8732

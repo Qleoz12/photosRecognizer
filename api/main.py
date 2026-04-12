@@ -7,8 +7,16 @@ import os
 import sys
 from pathlib import Path
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(_PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 # Carpeta logs en la raíz del proyecto
-LOGS_DIR = Path(__file__).parent.parent / "logs"
+LOGS_DIR = _PROJECT_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 API_LOG = LOGS_DIR / "api.log"
 
@@ -30,15 +38,17 @@ file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
 root_logger.addHandler(file_handler)
 
-from fastapi import FastAPI, Request
+from typing import Optional
+
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from api.routers import people, photos, search, memories, albums
+from api.routers import people, photos, search, memories, albums, share_public
 
-FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
-THUMBNAILS_DIR = Path(__file__).parent.parent / "data" / "thumbnails"
+FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
+THUMBNAILS_DIR = _PROJECT_ROOT / "data" / "thumbnails"
 
 app = FastAPI(
     title="PhotosRecognizer API",
@@ -48,23 +58,66 @@ app = FastAPI(
 
 log = logging.getLogger("photos_recognizer.api")
 
+try:
+    SLOW_REQUEST_MS = max(0, int(os.environ.get("SLOW_REQUEST_MS", "1000")))
+except ValueError:
+    SLOW_REQUEST_MS = 1000
+
+
+def _redact_share_token_in_path(path: str) -> str:
+    """No registrar tokens de enlaces compartidos en logs (api.log / consola)."""
+    if not path.startswith("/api/share/"):
+        return path
+    tail = path[len("/api/share/") :]
+    if tail == "create" or tail.startswith("create/"):
+        return path
+    idx = tail.find("/")
+    if idx == -1:
+        return "/api/share/<token>"
+    return "/api/share/<token>" + tail[idx:]
+
 
 @app.exception_handler(Exception)
 def log_unhandled_exceptions(request, exc):
     """Registra errores no capturados en logs/api.log"""
-    log.exception("Unhandled error: %s %s - %s", request.method, request.url.path, exc)
+    log.exception(
+        "Unhandled error: %s %s - %s",
+        request.method,
+        _redact_share_token_in_path(request.url.path),
+        exc,
+    )
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 
 @app.middleware("http")
 async def log_requests(request, call_next):
-    """Registra cada petición en logs/api.log"""
+    """Registra cada petición en logs/api.log; WARNING si supera SLOW_REQUEST_MS (env, default 1000)."""
     import time
     start = time.perf_counter()
     response = await call_next(request)
     elapsed = (time.perf_counter() - start) * 1000
-    log.info("%s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed)
+    path_safe = _redact_share_token_in_path(request.url.path)
+    if elapsed >= SLOW_REQUEST_MS:
+        log.warning(
+            "%s %s -> %d | %.0fms SLOW",
+            request.method,
+            path_safe,
+            response.status_code,
+            elapsed,
+        )
+    else:
+        log.info("%s %s -> %d | %.0fms", request.method, path_safe, response.status_code, elapsed)
+    return response
+
+
+@app.middleware("http")
+async def share_link_security_headers(request: Request, call_next):
+    """Cabeceras en rutas /api/share/*: menos fuga del token por Referer y endurecimiento básico."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/share/"):
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
     return response
 
 
@@ -77,9 +130,21 @@ async def cache_thumbnails(request, call_next):
     return response
 
 
+_cors_origins = [
+    "http://localhost:5892",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+_extra = os.environ.get("CORS_EXTRA_ORIGINS", "").strip()
+if _extra:
+    for part in _extra.split(","):
+        p = part.strip()
+        if p and p not in _cors_origins:
+            _cors_origins.append(p)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5892", "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,6 +155,7 @@ app.include_router(photos.router)
 app.include_router(search.router)
 app.include_router(memories.router)
 app.include_router(albums.router)
+app.include_router(share_public.router)
 
 # Serve thumbnails as static files
 THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,7 +163,11 @@ app.mount("/thumbnails", StaticFiles(directory=str(THUMBNAILS_DIR)), name="thumb
 
 # Serve cropped face thumbnail (bbox: x1,y1,x2,y2 normalized 0-1)
 @app.get("/originals/{file_id}/crop")
-def serve_face_crop(file_id: int, bbox: str):
+def serve_face_crop(
+    file_id: int,
+    bbox: str,
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
     """Crop a region of the image. bbox=x1,y1,x2,y2 (0-1 normalized)."""
     from api.deps import get_engine_cached
     from sqlalchemy.orm import Session
@@ -123,6 +193,10 @@ def serve_face_crop(file_id: int, bbox: str):
         f = session.get(File, file_id)
         if not f or not Path(f.path).exists():
             raise HTTPException(404, "File not found")
+        if getattr(f, "archived", 0) == 1:
+            from api.archive_pin import archive_pin_matches
+            if not archive_pin_matches(x_archive_pin):
+                raise HTTPException(404, "File not found")
         if f.file_type != "photo":
             raise HTTPException(400, "Only photos supported")
         fpath_str = f.path
@@ -152,8 +226,12 @@ def serve_face_crop(file_id: int, bbox: str):
 
 # Serve cropped face by face_id (uses face's file + bbox)
 @app.get("/faces/{face_id}/crop")
-def serve_face_crop_by_id(face_id: int):
+def serve_face_crop_by_id(
+    face_id: int,
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
     """Serve cropped thumbnail for a face. Photos: crop from image. Videos: serve full frame thumbnail (no timestamp stored)."""
+    from api.archive_pin import archive_pin_matches
     from api.deps import get_engine_cached
     from sqlalchemy.orm import Session
     from indexer.db import File, Face
@@ -169,6 +247,8 @@ def serve_face_crop_by_id(face_id: int):
             raise HTTPException(404, "Face not found")
         f = face.file
         if not f or not Path(f.path).exists():
+            raise HTTPException(404, "File not found")
+        if getattr(f, "archived", 0) == 1 and not archive_pin_matches(x_archive_pin):
             raise HTTPException(404, "File not found")
         if f.file_type == "video":
             # Videos: serve thumbnail (we don't store frame timestamp for face crop)
@@ -212,7 +292,12 @@ def serve_face_crop_by_id(face_id: int):
 
 # Serve original photos with EXIF orientation corrected
 @app.get("/originals/{file_id}")
-def serve_original(file_id: int, request: Request):
+def serve_original(
+    file_id: int,
+    request: Request,
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
+    from api.archive_pin import archive_pin_matches
     from api.deps import get_engine_cached
     from sqlalchemy.orm import Session
     from indexer.db import File
@@ -224,6 +309,8 @@ def serve_original(file_id: int, request: Request):
     with Session(get_engine_cached()) as session:
         f = session.get(File, file_id)
         if not f or not Path(f.path).exists():
+            raise HTTPException(404, "File not found")
+        if getattr(f, "archived", 0) == 1 and not archive_pin_matches(x_archive_pin):
             raise HTTPException(404, "File not found")
 
         fpath = Path(f.path)

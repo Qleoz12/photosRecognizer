@@ -111,3 +111,39 @@ def extract_frames(
                     yield ts, img
             except Exception:
                 continue
+
+
+def extract_first_frame_any(video_path: Path) -> "Image.Image | None":
+    """
+    Un fotograma para CLIP / asignación manual cuando no hay caras indexadas.
+    Reutiliza extract_frames; si falla (vídeo muy corto, duración desconocida), prueba t=0.
+    """
+    if Image is None:
+        return None
+    for _, img in extract_frames(video_path, max_frames=MAX_FRAMES):
+        return img
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "f0.jpg")
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    "0",
+                    "-i",
+                    str(video_path),
+                    "-vframes",
+                    "1",
+                    "-q:v",
+                    "2",
+                    out_path,
+                ],
+                capture_output=True,
+                timeout=45,
+            )
+            if result.returncode == 0 and os.path.exists(out_path):
+                return Image.open(out_path).copy()
+    except Exception:
+        pass
+    return None

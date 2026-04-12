@@ -393,7 +393,7 @@ export default function RecuerdoDetail() {
                         >
                           {f.thumbnail_path ? (
                             <img
-                              src={api.thumbnailUrl(f.thumbnail_path)}
+                              src={api.thumbnailUrl(f.thumbnail_path) ?? ""}
                               alt=""
                               className="w-full h-full object-cover"
                             />

@@ -1,6 +1,8 @@
 # Data: photos y thumbnails (no subir). La DB (data/photos.db) sí se puede subir.
 data/photos/
 data/thumbnails/
+# Respaldos de BD (photos_db.bat recreate / snapshot / wal; pueden ser muy grandes)
+data/db_backup/
 
 # Python
 __pycache__/
@@ -15,6 +17,9 @@ env/
 .eggs/
 dist/
 build/
+
+# Secretos locales (PIN archivo, etc.)
+.env
 
 # Node / Frontend
 frontend/node_modules/

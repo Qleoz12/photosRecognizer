@@ -24,6 +24,7 @@ from indexer.db import get_engine, Face, Cluster, File
 from indexer.embeddings_store import (
     update_face_cluster,
     create_or_update_cluster,
+    invalidate_cluster_centroids_cache,
 )
 
 
@@ -69,6 +70,10 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
         return
 
     embeddings = np.stack(embeddings_list)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    normed = embeddings / norms
+
     _log(f"Clustering {len(face_ids)} face embeddings with {algorithm.upper()}...")
 
     labels = _run_clustering(embeddings, algorithm, eps, min_samples)
@@ -77,18 +82,48 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
     cluster_count = len(set(labels) - {-1})
     _log(f"Found {cluster_count} clusters, {noise_count} noise faces.")
 
-    # Promote high-quality lone faces to solo clusters
-    labels = labels.copy()
-    next_id = cluster_count
+    # HDBSCAN can label everything as noise on some collections; DBSCAN on cosine
+    # distance often recovers usable groups for normalized face embeddings.
+    if cluster_count == 0 and len(face_ids) > 1:
+        _log("Ningún grupo denso en el primer paso; reintentando con DBSCAN (distancia coseno)...")
+        from sklearn.cluster import DBSCAN
+
+        fb_eps = max(0.4, min(0.55, float(eps) * 0.75))
+        labels = DBSCAN(eps=fb_eps, min_samples=2, metric="cosine", n_jobs=-1).fit_predict(normed)
+        noise_count = int((labels == -1).sum())
+        cluster_count = len(set(labels) - {-1})
+        _log(f"DBSCAN fallback (eps={fb_eps:.3f}): {cluster_count} clusters, {noise_count} noise.")
+
+    # Promote lone faces (still noise) to 1-face clusters if detection score is plausible.
+    # 0.7 was too strict for many real batches (videos, small faces) → casi todas quedaban sin persona.
+    labels = np.asarray(labels, dtype=np.int64).copy()
+    before_solo_clusters = len({int(x) for x in labels.tolist() if int(x) >= 0})
+    solo_floor = 0.5
+    max_l = int(np.max(labels)) if labels.size else -1
+    next_id = (max_l + 1) if max_l >= 0 else 0
     for i, (face_id, label) in enumerate(zip(face_ids, labels)):
-        if label == -1 and det_scores.get(face_id, 0.0) >= 0.7:
+        if int(label) == -1 and det_scores.get(face_id, 0.0) >= solo_floor:
             labels[i] = next_id
             next_id += 1
 
     kept_noise = int((labels == -1).sum())
-    solo = next_id - cluster_count
-    if solo:
-        _log(f"Added {solo} solo clusters for high-quality lone faces. {kept_noise} low-quality faces remain as noise.")
+    cluster_count_after = len({int(x) for x in labels.tolist() if int(x) >= 0})
+    solo_promoted = cluster_count_after - before_solo_clusters
+    if solo_promoted or kept_noise:
+        _log(
+            f"Promoción caras sueltas (det>={solo_floor}): +{solo_promoted} grupos; "
+            f"{kept_noise} caras siguen sin asignar."
+        )
+
+    # Último recurso: det_score ausente o muy bajo → todo quedaba sin grupo.
+    # Un solo cluster evita 0 personas en la UI sin crear miles de tarjetas (1 cara = 1 persona).
+    if kept_noise == len(face_ids) and len(face_ids) > 0:
+        _log(
+            "Ninguna cara cumplió los umbrales de agrupación; "
+            "asignando todas a un único grupo provisional (re-agrupa con otro eps o desde la web)."
+        )
+        labels[:] = 0
+        kept_noise = 0
 
     # Offset auto cluster IDs to avoid collisions with any existing manual IDs
     with Session(engine) as session:
@@ -130,6 +165,8 @@ def cluster_faces(algorithm: str = "hdbscan", eps: float = 0.6, min_samples: int
                 c.size = session.query(Face).filter(Face.cluster_id == cid).count()
 
         session.commit()
+
+    invalidate_cluster_centroids_cache()
 
     total_auto = len(cluster_sizes)
     _log(f"Clustering saved. Auto groups: {total_auto}, Manual groups preserved: {len(manual_cluster_ids)}")

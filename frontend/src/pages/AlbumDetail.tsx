@@ -1,8 +1,86 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api, AlbumOut, FileOut } from "../api";
 import PhotoCard from "../components/PhotoCard";
 import Spinner from "../components/Spinner";
+
+/** Misma lógica que `grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12` */
+function useAlbumSimilarGridCols(): number {
+  const [cols, setCols] = useState(4);
+  useEffect(() => {
+    const update = () => {
+      const w = window.innerWidth;
+      if (w >= 1024) setCols(12);
+      else if (w >= 768) setCols(8);
+      else if (w >= 640) setCols(6);
+      else setCols(4);
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return cols;
+}
+
+type NumberedSimilarGridProps<T> = {
+  gridCols: number;
+  items: readonly T[];
+  keyForItem: (item: T, index: number) => string | number;
+  renderItem: (item: T, index: number) => ReactNode;
+};
+
+function NumberedSimilarGrid<T>({ gridCols, items, keyForItem, renderItem }: NumberedSimilarGridProps<T>) {
+  const rows: T[][] = [];
+  for (let i = 0; i < items.length; i += gridCols) {
+    rows.push(items.slice(i, i + gridCols));
+  }
+  return (
+    <div className="select-none">
+      <div className="flex gap-2 mb-1 items-end">
+        <div
+          className="w-8 shrink-0 text-[10px] text-gray-500 text-right pr-1 pb-0.5 font-mono tabular-nums"
+          title="Filas (vertical) · Columnas (horizontal)"
+        />
+        <div
+          className="grid flex-1 gap-2"
+          style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}
+        >
+          {Array.from({ length: gridCols }, (_, c) => (
+            <div
+              key={c}
+              className="text-center text-[10px] font-mono text-gray-400 tabular-nums leading-none pb-0.5"
+            >
+              {c + 1}
+            </div>
+          ))}
+        </div>
+      </div>
+      {rows.map((rowItems, ri) => (
+        <div key={ri} className="flex gap-2 mb-2 items-start">
+          <div className="w-8 shrink-0 flex items-start justify-end pt-1 text-[10px] font-mono text-gray-400 tabular-nums pr-1">
+            {ri + 1}
+          </div>
+          <div
+            className="grid flex-1 gap-2"
+            style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}
+          >
+            {rowItems.map((item, ci) => {
+              const globalIndex = ri * gridCols + ci;
+              return (
+                <div key={keyForItem(item, globalIndex)} className="min-w-0">
+                  {renderItem(item, globalIndex)}
+                </div>
+              );
+            })}
+            {Array.from({ length: gridCols - rowItems.length }, (_, ei) => (
+              <div key={`pad-${ri}-${ei}`} className="min-w-0" aria-hidden />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function AlbumDetail() {
   const { id } = useParams<{ id: string }>();
@@ -22,6 +100,8 @@ export default function AlbumDetail() {
   const [newLabel, setNewLabel] = useState("");
   const [viewByFormat, setViewByFormat] = useState(false);
   const [similarModalOpen, setSimilarModalOpen] = useState(false);
+  /** Pantalla previa antes de lanzar búsqueda con CLIP (explica pool y límites) */
+  const [similarSearchPreludeOpen, setSimilarSearchPreludeOpen] = useState(false);
 
   const getExtension = (path: string) => {
     const m = path.match(/\.([^./\\]+)$/i);
@@ -34,6 +114,9 @@ export default function AlbumDetail() {
         sample_file_ids?: number[];
         cached_count?: number;
         computed_count?: number;
+        pool_size?: number;
+        uncached_remaining_after?: number;
+        total_cached_album?: number;
       } | null>(null);
   const [findingSimilar, setFindingSimilar] = useState(false);
   const [similarPoolCount, setSimilarPoolCount] = useState(0);
@@ -59,6 +142,17 @@ export default function AlbumDetail() {
   const CACHE_PAGE_SIZE = 100;
   const [currentCachePanelOpen, setCurrentCachePanelOpen] = useState(false);
   const [currentCacheView, setCurrentCacheView] = useState<"positivas" | "negativas" | "todas" | null>(null);
+  /** Selección múltiple en pestaña Sugeridas (find-similar) */
+  const [suggestedSelectMode, setSuggestedSelectMode] = useState(false);
+  const [suggestedSelected, setSuggestedSelected] = useState<Set<number>>(new Set());
+  const lastSuggestedIndexRef = useRef<number | null>(null);
+  const [batchAddingSuggestedToAlbum, setBatchAddingSuggestedToAlbum] = useState(false);
+  /** Selección múltiple en pestañas Positivas / Negativas (caché) del modal Similares */
+  const [cacheListSelectMode, setCacheListSelectMode] = useState(false);
+  const [cacheListSelected, setCacheListSelected] = useState<Set<number>>(new Set());
+  const lastCacheListIndexRef = useRef<number | null>(null);
+  const [cacheListBatchBusy, setCacheListBatchBusy] = useState(false);
+  const similarGridCols = useAlbumSimilarGridCols();
 
   const albumId = id ? parseInt(id, 10) : NaN;
 
@@ -83,6 +177,35 @@ export default function AlbumDetail() {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  useEffect(() => {
+    if (!similarModalOpen) {
+      setSuggestedSelectMode(false);
+      setSuggestedSelected(new Set());
+      lastSuggestedIndexRef.current = null;
+      setCacheListSelectMode(false);
+      setCacheListSelected(new Set());
+      lastCacheListIndexRef.current = null;
+    } else {
+      /* Modal abierto: no mezclar selección del panel Caché actual con el modal */
+      setCacheListSelectMode(false);
+      setCacheListSelected(new Set());
+      lastCacheListIndexRef.current = null;
+    }
+  }, [similarModalOpen]);
+
+  useEffect(() => {
+    if (similarTab !== "sugeridas") {
+      setSuggestedSelectMode(false);
+      setSuggestedSelected(new Set());
+      lastSuggestedIndexRef.current = null;
+    }
+    if (similarTab !== "positivas" && similarTab !== "negativas") {
+      setCacheListSelectMode(false);
+      setCacheListSelected(new Set());
+      lastCacheListIndexRef.current = null;
+    }
+  }, [similarTab]);
 
   const persistOrder = async (ordered: AlbumPhoto[]) => {
     if (isNaN(albumId)) return;
@@ -208,7 +331,7 @@ export default function AlbumDetail() {
 
   const albumFileIds = new Set(photos.map((p) => p.id));
 
-  const handleFindSimilarHere = async (maxNew = 1000) => {
+  const handleFindSimilarHere = async (maxNew = 500) => {
     if (isNaN(albumId) || photos.length === 0) return;
     setSimilarSourceLibrary(false);
     setSimilarTab("sugeridas");
@@ -251,18 +374,25 @@ export default function AlbumDetail() {
           sample_file_ids: data.sample_file_ids ?? [],
           cached_count: data.cached_count ?? 0,
           computed_count: data.computed_count ?? 0,
+          pool_size: data.pool_size,
+          uncached_remaining_after: data.uncached_remaining_after,
+          total_cached_album: data.total_cached_album,
         });
       const byId: Record<number, FileOut> = {};
-      for (const r of data.results) {
-        if (poolFiles[r.file_id]) byId[r.file_id] = poolFiles[r.file_id];
-        else {
-          try {
-            const f = await api.getPhoto(r.file_id);
-            byId[r.file_id] = f;
-          } catch {
-            /* ignorar */
-          }
-        }
+      const ids = data.results.map((r) => r.file_id);
+      const CHUNK = 24;
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const slice = ids.slice(i, i + CHUNK);
+        const loaded = await Promise.all(
+          slice.map((id) =>
+            poolFiles[id]
+              ? Promise.resolve(poolFiles[id])
+              : api.getPhoto(id).catch(() => null)
+          )
+        );
+        slice.forEach((id, j) => {
+          if (loaded[j]) byId[id] = loaded[j] as FileOut;
+        });
       }
       setSimilarFiles(byId);
       refreshCacheStats();
@@ -286,7 +416,7 @@ export default function AlbumDetail() {
     try {
       const data = await api.findSimilarLibrary(
         albumId,
-        1000,
+        500,
         true,
         searchByContent ? excludeFacesFromCentroid : false
       );
@@ -297,17 +427,21 @@ export default function AlbumDetail() {
         sample_file_ids: data.sample_file_ids ?? [],
         cached_count: data.cached_count ?? 0,
         computed_count: data.computed_count ?? 0,
+        pool_size: data.pool_size,
+        uncached_remaining_after: data.uncached_remaining_after,
+        total_cached_album: data.total_cached_album,
       });
       const stats = await api.getAlbumSearchCacheStats(albumId);
-      setSimilarPoolCount(stats.total_photos);
+      setSimilarPoolCount(data.pool_size ?? stats.total_photos);
       const byId: Record<number, FileOut> = {};
-      for (const r of data.results) {
-        try {
-          const f = await api.getPhoto(r.file_id);
-          byId[r.file_id] = f;
-        } catch {
-          /* ignorar */
-        }
+      const ids = data.results.map((r) => r.file_id);
+      const CHUNK = 24;
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const slice = ids.slice(i, i + CHUNK);
+        const loaded = await Promise.all(slice.map((id) => api.getPhoto(id).catch(() => null)));
+        slice.forEach((id, j) => {
+          if (loaded[j]) byId[id] = loaded[j] as FileOut;
+        });
       }
       setSimilarFiles(byId);
       refreshCacheStats();
@@ -365,39 +499,275 @@ export default function AlbumDetail() {
   );
 
   const loadMoreCacheList = useCallback(() => {
-    if (currentCacheView && cacheListItems.length < cacheListTotal) {
-      loadCacheList(currentCacheView, true, cacheListItems.length);
-    }
+    if (!currentCacheView || cacheListItems.length >= cacheListTotal) return;
+    const status: "positive" | "negative" | "all" =
+      currentCacheView === "positivas"
+        ? "positive"
+        : currentCacheView === "negativas"
+          ? "negative"
+          : "all";
+    loadCacheList(status, true, cacheListItems.length);
   }, [currentCacheView, cacheListItems.length, cacheListTotal, loadCacheList]);
 
-  const handleSetCacheStatus = async (fileId: number, status: "positive" | "negative") => {
-    if (isNaN(albumId)) return;
-    try {
-      await api.setCacheManualStatus(albumId, fileId, status);
-      setCacheListItems((prev) => prev.filter((r) => r.file_id !== fileId));
-      setCacheListFiles((prev) => {
-        const next = { ...prev };
-        delete next[fileId];
+  const toggleSimilarSuggested = useCallback(
+    (fileId: number, index: number, e: React.MouseEvent) => {
+      if (e.shiftKey) e.preventDefault();
+      const shift = e.shiftKey;
+      setSuggestedSelected((prev) => {
+        if (shift && lastSuggestedIndexRef.current !== null) {
+          const lo = Math.min(lastSuggestedIndexRef.current, index);
+          const hi = Math.max(lastSuggestedIndexRef.current, index);
+          const next = new Set<number>();
+          for (let i = lo; i <= hi; i++) {
+            const row = similarResults[i];
+            if (row) next.add(row.file_id);
+          }
+          lastSuggestedIndexRef.current = index;
+          return next;
+        }
+        lastSuggestedIndexRef.current = index;
+        const next = new Set(prev);
+        if (next.has(fileId)) next.delete(fileId);
+        else next.add(fileId);
         return next;
       });
-      setCacheListTotal((t) => Math.max(0, t - 1));
+    },
+    [similarResults]
+  );
+
+  const handleBatchSuggestedStatus = async (status: "positive" | "negative") => {
+    const ids = Array.from(suggestedSelected);
+    if (ids.length === 0 || isNaN(albumId)) return;
+    try {
+      const res = await api.setCacheManualStatusBatch(albumId, ids, status);
+      const done = new Set(res.file_ids);
+      setSimilarResults((prev) => prev.filter((r) => !done.has(r.file_id)));
+      setSuggestedSelected(new Set());
+      lastSuggestedIndexRef.current = null;
       refreshCacheStats();
+      if (res.updated < ids.length) {
+        alert(
+          `Marcadas ${res.updated} de ${ids.length}. Las demás no estaban en el caché de este álbum.`
+        );
+      }
     } catch (e) {
       alert("Error: " + e);
     }
   };
 
-  const handleAddSimilarToAlbum = async (fileId: number) => {
-    if (isNaN(albumId)) return;
+  const handleBatchAddSuggestedToAlbum = async () => {
+    if (isNaN(albumId) || suggestedSelected.size === 0) return;
+    const already = new Set(photos.map((p) => p.id));
+    const ids = Array.from(suggestedSelected);
+    const toAdd = ids.filter((id) => !already.has(id));
+    if (toAdd.length === 0) {
+      alert("Las fotos seleccionadas ya están en este álbum.");
+      return;
+    }
+    setBatchAddingSuggestedToAlbum(true);
+    try {
+      await api.addFilesToAlbum(albumId, toAdd);
+      const addedRows: AlbumPhoto[] = [];
+      for (const id of toAdd) {
+        const f = similarFiles[id];
+        if (f) addedRows.push({ ...f, use_in_centroid: true });
+      }
+      const done = new Set(toAdd);
+      setSimilarResults((prev) => prev.filter((r) => !done.has(r.file_id)));
+      setPhotos((prev) => [...prev, ...addedRows]);
+      setAlbum((prev) =>
+        prev ? { ...prev, file_count: (prev.file_count || 0) + toAdd.length } : null
+      );
+      setSuggestedSelected(new Set());
+      lastSuggestedIndexRef.current = null;
+      setSuggestedSelectMode(false);
+      refreshCacheStats();
+      if (toAdd.length < ids.length) {
+        alert(
+          `${toAdd.length} añadida(s) al álbum. ${ids.length - toAdd.length} ya estaban en el álbum.`
+        );
+      }
+    } catch (e) {
+      alert("Error: " + e);
+    } finally {
+      setBatchAddingSuggestedToAlbum(false);
+    }
+  };
+
+  const toggleCacheListSelect = useCallback(
+    (fileId: number, index: number, e: React.MouseEvent) => {
+      if (e.shiftKey) e.preventDefault();
+      const shift = e.shiftKey;
+      setCacheListSelected((prev) => {
+        if (shift && lastCacheListIndexRef.current !== null) {
+          const lo = Math.min(lastCacheListIndexRef.current, index);
+          const hi = Math.max(lastCacheListIndexRef.current, index);
+          const next = new Set<number>();
+          for (let i = lo; i <= hi; i++) {
+            const row = cacheListItems[i];
+            if (row) next.add(row.file_id);
+          }
+          lastCacheListIndexRef.current = index;
+          return next;
+        }
+        lastCacheListIndexRef.current = index;
+        const next = new Set(prev);
+        if (next.has(fileId)) next.delete(fileId);
+        else next.add(fileId);
+        return next;
+      });
+    },
+    [cacheListItems]
+  );
+
+  const handleBatchCacheListMark = async (status: "positive" | "negative") => {
+    const ids = Array.from(cacheListSelected);
+    if (ids.length === 0 || isNaN(albumId)) return;
+    setCacheListBatchBusy(true);
+    try {
+      const res = await api.setCacheManualStatusBatch(albumId, ids, status);
+      const done = new Set(res.file_ids);
+      setCacheListItems((prev) => prev.filter((r) => !done.has(r.file_id)));
+      setCacheListFiles((prev) => {
+        const next = { ...prev };
+        for (const fid of res.file_ids) delete next[fid];
+        return next;
+      });
+      setCacheListTotal((t) => Math.max(0, t - res.updated));
+      setCacheListSelected(new Set());
+      lastCacheListIndexRef.current = null;
+      setCacheListSelectMode(false);
+      refreshCacheStats();
+      if (res.updated < ids.length) {
+        alert(
+          `Actualizadas ${res.updated} de ${ids.length}. Las demás no estaban en el caché de este álbum.`
+        );
+      }
+    } catch (e) {
+      alert("Error: " + e);
+    } finally {
+      setCacheListBatchBusy(false);
+    }
+  };
+
+  const handleBatchAddCacheListToAlbum = async () => {
+    if (isNaN(albumId) || similarTab !== "positivas" || cacheListSelected.size === 0) return;
+    const already = new Set(photos.map((p) => p.id));
+    const ids = Array.from(cacheListSelected);
+    const toAdd = ids.filter((id) => !already.has(id));
+    if (toAdd.length === 0) {
+      alert("Las fotos seleccionadas ya están en este álbum.");
+      return;
+    }
+    setCacheListBatchBusy(true);
+    try {
+      await api.addFilesToAlbum(albumId, toAdd);
+      const addedRows: AlbumPhoto[] = [];
+      for (const id of toAdd) {
+        const f = cacheListFiles[id];
+        if (f) addedRows.push({ ...f, use_in_centroid: true });
+      }
+      const done = new Set(toAdd);
+      setCacheListItems((prev) => prev.filter((r) => !done.has(r.file_id)));
+      setCacheListFiles((prev) => {
+        const next = { ...prev };
+        for (const fid of toAdd) delete next[fid];
+        return next;
+      });
+      setCacheListTotal((t) => Math.max(0, t - toAdd.length));
+      setPhotos((prev) => [...prev, ...addedRows]);
+      setAlbum((prev) =>
+        prev ? { ...prev, file_count: (prev.file_count || 0) + toAdd.length } : null
+      );
+      setCacheListSelected(new Set());
+      lastCacheListIndexRef.current = null;
+      setCacheListSelectMode(false);
+      refreshCacheStats();
+      if (toAdd.length < ids.length) {
+        alert(
+          `${toAdd.length} añadida(s) al álbum. ${ids.length - toAdd.length} ya estaban en el álbum.`
+        );
+      }
+    } catch (e) {
+      alert("Error: " + e);
+    } finally {
+      setCacheListBatchBusy(false);
+    }
+  };
+
+  const handleSetCacheStatus = async (
+    fileId: number,
+    status: "positive" | "negative",
+    opts?: { fromSuggested?: boolean },
+  ): Promise<boolean> => {
+    if (isNaN(albumId)) return false;
+    try {
+      await api.setCacheManualStatus(albumId, fileId, status);
+      if (opts?.fromSuggested) {
+        setSimilarResults((prev) => prev.filter((r) => r.file_id !== fileId));
+      } else {
+        setCacheListItems((prev) => prev.filter((r) => r.file_id !== fileId));
+        setCacheListFiles((prev) => {
+          const next = { ...prev };
+          delete next[fileId];
+          return next;
+        });
+        setCacheListTotal((t) => Math.max(0, t - 1));
+      }
+      refreshCacheStats();
+      return true;
+    } catch (e) {
+      alert("Error: " + e);
+      return false;
+    }
+  };
+
+  const handleAddSimilarToAlbum = async (fileId: number): Promise<boolean> => {
+    if (isNaN(albumId)) return false;
     try {
       await api.addFilesToAlbum(albumId, [fileId]);
       setSimilarResults((prev) => prev.filter((r) => r.file_id !== fileId));
       setPhotos((prev) => [...prev, { ...similarFiles[fileId], use_in_centroid: true }].filter(Boolean) as AlbumPhoto[]);
       setAlbum((prev) => (prev ? { ...prev, file_count: (prev.file_count || 0) + 1 } : null));
+      return true;
     } catch (e) {
       alert("Error: " + e);
+      return false;
     }
   };
+
+  const similarLightboxBar = useMemo(() => {
+    if (!lightbox) return null;
+
+    if (similarModalOpen) {
+      if (similarTab === "sugeridas") {
+        const row = similarResults.find((r) => r.file_id === lightbox.id);
+        if (row) return { variant: "suggested" as const, sim: row.similarity };
+      }
+      if (similarTab === "positivas") {
+        const row = cacheListItems.find((r) => r.file_id === lightbox.id);
+        if (row) return { variant: "positive" as const, sim: row.similarity };
+      }
+      if (similarTab === "negativas") {
+        const row = cacheListItems.find((r) => r.file_id === lightbox.id);
+        if (row) return { variant: "negative" as const, sim: row.similarity };
+      }
+      return null;
+    }
+
+    if (
+      currentCacheView &&
+      (currentCacheView === "positivas" || currentCacheView === "negativas" || currentCacheView === "todas")
+    ) {
+      const row = cacheListItems.find((r) => r.file_id === lightbox.id);
+      if (!row) return null;
+      if (currentCacheView === "positivas") return { variant: "positive" as const, sim: row.similarity };
+      if (currentCacheView === "negativas") return { variant: "negative" as const, sim: row.similarity };
+      return { variant: "all" as const, sim: row.similarity };
+    }
+
+    return null;
+  }, [lightbox, similarModalOpen, similarTab, similarResults, cacheListItems, currentCacheView]);
 
   if (loading || !album) return <Spinner message="Cargando..." />;
 
@@ -483,20 +853,11 @@ export default function AlbumDetail() {
         )}
         <button
           type="button"
-          onClick={() => handleFindSimilarHere(1000)}
+          onClick={() => setSimilarSearchPreludeOpen(true)}
           disabled={photos.length === 0 || findingSimilar}
           className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-sm font-medium"
         >
           {findingSimilar ? "Buscando..." : "Buscar similares aquí"}
-        </button>
-        <button
-          type="button"
-          onClick={() => handleFindSimilarHere(0)}
-          disabled={photos.length === 0 || findingSimilar}
-          className="px-3 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 text-sm"
-          title="Solo resultados ya en cache (instantáneo si ya buscaste antes)"
-        >
-          Solo cache
         </button>
         {searchByContent && (
           <button
@@ -527,7 +888,9 @@ export default function AlbumDetail() {
           </label>
         )}
         <span className="text-xs text-gray-500 max-w-md">
-          Documentos: 1000 nuevas/request o &quot;Solo cache&quot;. Borrar cache para recalcular.
+          Documentos: hasta 500 nuevas por búsqueda desde aquí (el API admite hasta 1000). Sin procesar nuevas: en{" "}
+          <strong className="text-gray-400">Caché actual</strong> → «Abrir similares (solo caché)». Borrar caché para
+          recalcular.
         </span>
         {cacheStats && cacheStats.cached_count > 0 && (
           <button
@@ -610,8 +973,16 @@ export default function AlbumDetail() {
           <button
             type="button"
             onClick={() => {
-              setCurrentCachePanelOpen((v) => !v);
-              if (!currentCachePanelOpen) setCurrentCacheView(null);
+              setCurrentCachePanelOpen((prev) => {
+                if (prev) {
+                  setCurrentCacheView(null);
+                  setCacheListSelectMode(false);
+                  setCacheListSelected(new Set());
+                  lastCacheListIndexRef.current = null;
+                  return false;
+                }
+                return true;
+              });
             }}
             className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-purple-900/30 transition-colors"
           >
@@ -625,10 +996,29 @@ export default function AlbumDetail() {
               <p className="text-sm text-gray-400 mb-3">
                 Fotos ya clasificadas en la BD. Sin necesidad de procesar de nuevo.
               </p>
+              <div className="mb-4 p-3 rounded-lg bg-gray-900/80 border border-purple-800/40 text-sm text-gray-300">
+                <p className="mb-2">
+                  <strong className="text-purple-200">Solo caché (sin CLIP nuevos):</strong> abre el visor de similares
+                  con sugerencias solo desde datos ya guardados (pool ~5000 fotos; no calcula embeddings nuevos). Para
+                  ver <strong>todas</strong> las positivas/negativas clasificadas y selección múltiple, usá las pestañas
+                  de abajo en esta misma sección.
+                </p>
+                <button
+                  type="button"
+                  disabled={photos.length === 0 || findingSimilar}
+                  onClick={() => void handleFindSimilarHere(0)}
+                  className="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-100 border border-gray-600"
+                >
+                  {findingSimilar ? "Abriendo…" : "Abrir similares (solo caché)"}
+                </button>
+              </div>
               <div className="flex flex-wrap gap-2 mb-4">
                 <button
                   type="button"
                   onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
                     setCurrentCacheView("positivas");
                     loadCacheList("positive", false);
                   }}
@@ -641,6 +1031,9 @@ export default function AlbumDetail() {
                 <button
                   type="button"
                   onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
                     setCurrentCacheView("negativas");
                     loadCacheList("negative", false);
                   }}
@@ -653,6 +1046,9 @@ export default function AlbumDetail() {
                 <button
                   type="button"
                   onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
                     setCurrentCacheView("todas");
                     loadCacheList("all", false);
                   }}
@@ -687,65 +1083,143 @@ export default function AlbumDetail() {
                         </button>
                       </div>
                     )}
-                  <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-2">
-                    {cacheListItems.map((r) => {
+                    {currentCacheView === "positivas" && cacheListItems.length > 0 && !loadingCacheList && (
+                      <div className="flex flex-wrap items-center gap-2 mb-3 p-2 rounded-lg bg-purple-950/50 border border-purple-800/50">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCacheListSelectMode((m) => !m);
+                            if (cacheListSelectMode) {
+                              setCacheListSelected(new Set());
+                              lastCacheListIndexRef.current = null;
+                            }
+                          }}
+                          className={`px-2.5 py-1 rounded text-xs font-medium ${
+                            cacheListSelectMode
+                              ? "bg-green-700 text-white"
+                              : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                          }`}
+                        >
+                          {cacheListSelectMode ? "Salir de selección" : "Seleccionar varias"}
+                        </button>
+                        {cacheListSelectMode && (
+                          <>
+                            <span className="text-xs text-gray-400">
+                              {cacheListSelected.size} elegida{cacheListSelected.size !== 1 ? "s" : ""}
+                            </span>
+                            <button
+                              type="button"
+                              disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                              onClick={() => void handleBatchCacheListMark("negative")}
+                              className="px-2.5 py-1 rounded text-xs font-medium bg-amber-800 text-white hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              Marcar negativas
+                            </button>
+                            <button
+                              type="button"
+                              disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                              onClick={() => void handleBatchAddCacheListToAlbum()}
+                              className="px-2.5 py-1 rounded text-xs font-medium bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              Añadir al álbum
+                            </button>
+                            <button
+                              type="button"
+                              disabled={cacheListSelected.size === 0}
+                              onClick={() => {
+                                setCacheListSelected(new Set());
+                                lastCacheListIndexRef.current = null;
+                              }}
+                              className="px-2 py-1 rounded text-xs text-gray-400 hover:text-white disabled:opacity-40"
+                            >
+                              Limpiar
+                            </button>
+                            <span className="text-[10px] text-gray-500">Shift+clic: rango</span>
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {currentCacheView === "negativas" && cacheListItems.length > 0 && !loadingCacheList && (
+                      <div className="flex flex-wrap items-center gap-2 mb-3 p-2 rounded-lg bg-purple-950/50 border border-purple-800/50">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCacheListSelectMode((m) => !m);
+                            if (cacheListSelectMode) {
+                              setCacheListSelected(new Set());
+                              lastCacheListIndexRef.current = null;
+                            }
+                          }}
+                          className={`px-2.5 py-1 rounded text-xs font-medium ${
+                            cacheListSelectMode
+                              ? "bg-amber-700 text-white"
+                              : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                          }`}
+                        >
+                          {cacheListSelectMode ? "Salir de selección" : "Seleccionar varias"}
+                        </button>
+                        {cacheListSelectMode && (
+                          <>
+                            <span className="text-xs text-gray-400">
+                              {cacheListSelected.size} elegida{cacheListSelected.size !== 1 ? "s" : ""}
+                            </span>
+                            <button
+                              type="button"
+                              disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                              onClick={() => void handleBatchCacheListMark("positive")}
+                              className="px-2.5 py-1 rounded text-xs font-medium bg-green-700 text-white hover:bg-green-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              Marcar positivas
+                            </button>
+                            <button
+                              type="button"
+                              disabled={cacheListSelected.size === 0}
+                              onClick={() => {
+                                setCacheListSelected(new Set());
+                                lastCacheListIndexRef.current = null;
+                              }}
+                              className="px-2 py-1 rounded text-xs text-gray-400 hover:text-white disabled:opacity-40"
+                            >
+                              Limpiar
+                            </button>
+                            <span className="text-[10px] text-gray-500">Shift+clic: rango</span>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  <NumberedSimilarGrid
+                    gridCols={similarGridCols}
+                    items={cacheListItems}
+                    keyForItem={(r) => r.file_id}
+                    renderItem={(r, index) => {
                       const f = cacheListFiles[r.file_id];
-                      if (!f) return null;
-                      return (
-                        <div key={r.file_id} className="relative group">
-                          <PhotoCard file={f} onClick={() => setLightbox(f)} />
+                      if (!f) {
+                        return (
                           <div
-                            className="absolute inset-0 flex flex-col items-center justify-center gap-1 opacity-0 group-hover:opacity-100 bg-black/60 rounded-lg transition-opacity pointer-events-none group-hover:pointer-events-auto cursor-pointer"
-                            onClick={() => setLightbox(f)}
-                          >
-                            {currentCacheView === "positivas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleAddSimilarToAlbum(r.file_id); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-purple-600 hover:bg-purple-500"
-                              >
-                                + Álbum
-                              </button>
-                            )}
-                            {currentCacheView === "positivas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "negative"); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-amber-700 hover:bg-amber-600"
-                              >
-                                → Negativas
-                              </button>
-                            )}
-                            {currentCacheView === "negativas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "positive"); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-green-700 hover:bg-green-600"
-                              >
-                                → Positivas
-                              </button>
-                            )}
-                            {currentCacheView === "todas" && (
-                              <>
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "positive"); }}
-                                  className="px-2 py-1 rounded text-white text-xs bg-green-700 hover:bg-green-600"
-                                >
-                                  → ⊕
-                                </button>
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "negative"); }}
-                                  className="px-2 py-1 rounded text-white text-xs bg-amber-700 hover:bg-amber-600"
-                                >
-                                  → ⊖
-                                </button>
-                              </>
-                            )}
-                          </div>
-                          <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5">
+                            className="aspect-[4/3] rounded-lg bg-gray-800/40 border border-dashed border-gray-700"
+                            aria-hidden
+                          />
+                        );
+                      }
+                      const inPanelSelect =
+                        cacheListSelectMode &&
+                        (currentCacheView === "positivas" || currentCacheView === "negativas");
+                      return (
+                        <div className="relative group">
+                          <PhotoCard
+                            file={f}
+                            selectable={inPanelSelect}
+                            selected={cacheListSelected.has(r.file_id)}
+                            onSelect={(e) => toggleCacheListSelect(r.file_id, index, e)}
+                            onClick={inPanelSelect ? undefined : () => setLightbox(f)}
+                          />
+                          <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5 pointer-events-none">
                             {Math.round(r.similarity * 100)}%
                           </span>
                         </div>
                       );
-                    })}
-                  </div>
+                    }}
+                  />
                   </>
                 )
               )}
@@ -817,7 +1291,7 @@ export default function AlbumDetail() {
                     {ext} <span className="text-gray-500">({byExt.get(ext)!.length})</span>
                   </h3>
                   <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-1">
-                    {byExt.get(ext)!.map((f, idx) => (
+                    {byExt.get(ext)!.map((f) => (
                       <div key={f.id} className="relative group rounded-lg">
                         <PhotoCard
                           file={f}
@@ -929,9 +1403,170 @@ export default function AlbumDetail() {
                 className="max-w-full max-h-[85vh] rounded-lg bg-black"
               />
             )}
-            <button onClick={() => setLightbox(null)} className="mt-2 text-gray-400 hover:text-white">
+            {similarLightboxBar && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <span className="text-sm text-gray-400 tabular-nums">
+                  Similitud: {Math.round(similarLightboxBar.sim * 100)}%
+                </span>
+                {similarLightboxBar.variant === "suggested" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleAddSimilarToAlbum(lightbox.id)) setLightbox(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-purple-600 hover:bg-purple-500 text-white"
+                    >
+                      + Álbum
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleSetCacheStatus(lightbox.id, "positive", { fromSuggested: true })) {
+                          setLightbox(null);
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 text-white"
+                    >
+                      → Positivas
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleSetCacheStatus(lightbox.id, "negative", { fromSuggested: true })) {
+                          setLightbox(null);
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-amber-700 hover:bg-amber-600 text-white"
+                    >
+                      → Negativas
+                    </button>
+                  </>
+                )}
+                {similarLightboxBar.variant === "positive" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleAddSimilarToAlbum(lightbox.id)) setLightbox(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-purple-600 hover:bg-purple-500 text-white"
+                    >
+                      + Álbum
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleSetCacheStatus(lightbox.id, "negative")) setLightbox(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-amber-700 hover:bg-amber-600 text-white"
+                    >
+                      → Negativas
+                    </button>
+                  </>
+                )}
+                {similarLightboxBar.variant === "negative" && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (await handleSetCacheStatus(lightbox.id, "positive")) setLightbox(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 text-white"
+                  >
+                    → Positivas
+                  </button>
+                )}
+                {similarLightboxBar.variant === "all" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleSetCacheStatus(lightbox.id, "positive")) setLightbox(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 text-white"
+                    >
+                      Marcar positiva
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (await handleSetCacheStatus(lightbox.id, "negative")) setLightbox(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-sm bg-amber-700 hover:bg-amber-600 text-white"
+                    >
+                      Marcar negativa
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            <button type="button" onClick={() => setLightbox(null)} className="mt-2 text-gray-400 hover:text-white">
               ✕ Cerrar
             </button>
+          </div>
+        </div>
+      )}
+
+      {similarSearchPreludeOpen && (
+        <div
+          className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4"
+          onClick={() => setSimilarSearchPreludeOpen(false)}
+        >
+          <div
+            className="bg-gray-900 rounded-xl max-w-lg w-full border border-purple-800/60 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-5 border-b border-gray-700">
+              <h2 className="text-lg font-semibold text-white">Buscar similares en la galería</h2>
+              <p className="text-sm text-gray-400 mt-1">
+                {searchByContent
+                  ? "Modo documentos (CLIP). Resumen de lo que va a pasar:"
+                  : "Modo caras. Resumen de lo que va a pasar:"}
+              </p>
+            </div>
+            <ul className="p-5 text-sm text-gray-300 space-y-2 list-disc pl-5">
+              <li>
+                Se arma un grupo de hasta ~5.000 fotos de la biblioteca que{" "}
+                <strong className="text-gray-200">no</strong> están en este álbum.
+              </li>
+              {searchByContent ? (
+                <li>
+                  En esta pasada se pueden calcular como máximo{" "}
+                  <strong className="text-purple-200">500</strong> fotos nuevas (sin fila en el caché de este álbum)
+                  usando CLIP; el resto del avance queda para la próxima vez que busques. Puede tardar bastante.
+                </li>
+              ) : (
+                <li>
+                  Se comparan rostros en el pool; el límite de trabajo por pasada sigue el mismo flujo que en el
+                  servidor (máx. nuevas por request).
+                </li>
+              )}
+              <li>Las fotos que ya tenían resultado en el caché de este álbum se reutilizan sin recalcular.</li>
+              <li>
+                Después se abre el panel con <strong className="text-gray-200">Sugeridas</strong> y las pestañas de
+                positivas/negativas del caché.
+              </li>
+            </ul>
+            <div className="p-4 border-t border-gray-700 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setSimilarSearchPreludeOpen(false)}
+                className="px-4 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-800"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSimilarSearchPreludeOpen(false);
+                  void handleFindSimilarHere(500);
+                }}
+                disabled={findingSimilar}
+                className="px-4 py-2 rounded-lg text-sm bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50"
+              >
+                Continuar
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -976,7 +1611,7 @@ export default function AlbumDetail() {
                   >
                     {f.thumbnail_path ? (
                       <img
-                        src={api.thumbnailUrl(f.thumbnail_path)}
+                        src={api.thumbnailUrl(f.thumbnail_path) ?? ""}
                         alt=""
                         className="w-16 h-16 rounded-lg object-cover"
                       />
@@ -1043,6 +1678,15 @@ export default function AlbumDetail() {
                     {similarMeta.cached_count !== undefined && similarMeta.computed_count !== undefined && similarMeta.use_clip && (
                       <> · Cache: {similarMeta.cached_count} ya procesadas, {similarMeta.computed_count} nuevas esta vez</>
                     )}
+                    {similarMeta.use_clip && similarMeta.pool_size != null && (
+                      <> · Candidatas (fuera del álbum): {similarMeta.pool_size.toLocaleString()}</>
+                    )}
+                    {similarMeta.use_clip && similarMeta.uncached_remaining_after != null && (
+                      <> · Sin caché aún en pool: ~{similarMeta.uncached_remaining_after.toLocaleString()}</>
+                    )}
+                    {similarMeta.use_clip && similarMeta.total_cached_album != null && (
+                      <> · Filas en caché del álbum: {similarMeta.total_cached_album.toLocaleString()}</>
+                    )}
                   </p>
                 )}
                 {photos.length > 0 && (
@@ -1069,7 +1713,7 @@ export default function AlbumDetail() {
                           >
                             {f.thumbnail_path ? (
                               <img
-                                src={api.thumbnailUrl(f.thumbnail_path)}
+                                src={api.thumbnailUrl(f.thumbnail_path) ?? ""}
                                 alt=""
                                 className="w-full h-full object-cover"
                               />
@@ -1109,7 +1753,12 @@ export default function AlbumDetail() {
               <div className="px-4 pb-2 flex gap-2 border-b border-gray-700">
                 <button
                   type="button"
-                  onClick={() => setSimilarTab("sugeridas")}
+                  onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
+                    setSimilarTab("sugeridas");
+                  }}
                   className={`px-3 py-1 rounded text-sm ${similarTab === "sugeridas" ? "bg-purple-600 text-white" : "bg-gray-700 text-gray-400 hover:text-white"}`}
                 >
                   Sugeridas
@@ -1117,6 +1766,9 @@ export default function AlbumDetail() {
                 <button
                   type="button"
                   onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
                     setSimilarTab("positivas");
                     loadCacheList("positive");
                   }}
@@ -1127,6 +1779,9 @@ export default function AlbumDetail() {
                 <button
                   type="button"
                   onClick={() => {
+                    setCacheListSelectMode(false);
+                    setCacheListSelected(new Set());
+                    lastCacheListIndexRef.current = null;
                     setSimilarTab("negativas");
                     loadCacheList("negative");
                   }}
@@ -1136,10 +1791,203 @@ export default function AlbumDetail() {
                 </button>
               </div>
             )}
+            {searchByContent && cacheStats && !findingSimilar && (
+              <p className="text-xs text-gray-500 px-4 pb-2 border-b border-gray-800/80">
+                Pulsa una miniatura para abrirla en grande; ahí verás las acciones (+ Álbum, positivas/negativas).
+                «Seleccionar varias»: en Sugeridas (caché + álbum); en Positivas (negativas en caché + álbum); en
+                Negativas solo pasar a positivas en caché.
+              </p>
+            )}
+            {searchByContent &&
+              cacheStats &&
+              !findingSimilar &&
+              similarTab === "sugeridas" &&
+              similarResults.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-gray-800/80 bg-gray-900/60">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSuggestedSelectMode((m) => !m);
+                      if (suggestedSelectMode) {
+                        setSuggestedSelected(new Set());
+                        lastSuggestedIndexRef.current = null;
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded text-xs font-medium ${
+                      suggestedSelectMode
+                        ? "bg-purple-600 text-white"
+                        : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                    }`}
+                  >
+                    {suggestedSelectMode ? "Salir de selección" : "Seleccionar varias"}
+                  </button>
+                  {suggestedSelectMode && (
+                    <>
+                      <span className="text-xs text-gray-400">
+                        {suggestedSelected.size} elegida{suggestedSelected.size !== 1 ? "s" : ""}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={suggestedSelected.size === 0}
+                        onClick={() => void handleBatchSuggestedStatus("positive")}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-green-700 text-white hover:bg-green-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Marcar positivas
+                      </button>
+                      <button
+                        type="button"
+                        disabled={suggestedSelected.size === 0}
+                        onClick={() => void handleBatchSuggestedStatus("negative")}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-amber-800 text-white hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Marcar negativas
+                      </button>
+                      <button
+                        type="button"
+                        disabled={suggestedSelected.size === 0 || batchAddingSuggestedToAlbum}
+                        onClick={() => void handleBatchAddSuggestedToAlbum()}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {batchAddingSuggestedToAlbum ? "Añadiendo…" : "Añadir al álbum"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={suggestedSelected.size === 0}
+                        onClick={() => {
+                          setSuggestedSelected(new Set());
+                          lastSuggestedIndexRef.current = null;
+                        }}
+                        className="px-2 py-1 rounded text-xs text-gray-400 hover:text-white disabled:opacity-40"
+                      >
+                        Limpiar
+                      </button>
+                      <span className="text-[10px] text-gray-500">Shift+clic: rango</span>
+                    </>
+                  )}
+                </div>
+              )}
+            {searchByContent &&
+              cacheStats &&
+              !findingSimilar &&
+              similarTab === "positivas" &&
+              cacheListItems.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-gray-800/80 bg-gray-900/60">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCacheListSelectMode((m) => !m);
+                      if (cacheListSelectMode) {
+                        setCacheListSelected(new Set());
+                        lastCacheListIndexRef.current = null;
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded text-xs font-medium ${
+                      cacheListSelectMode
+                        ? "bg-green-700 text-white"
+                        : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                    }`}
+                  >
+                    {cacheListSelectMode ? "Salir de selección" : "Seleccionar varias"}
+                  </button>
+                  {cacheListSelectMode && (
+                    <>
+                      <span className="text-xs text-gray-400">
+                        {cacheListSelected.size} elegida{cacheListSelected.size !== 1 ? "s" : ""}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                        onClick={() => void handleBatchCacheListMark("negative")}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-amber-800 text-white hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Marcar negativas
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                        onClick={() => void handleBatchAddCacheListToAlbum()}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Añadir al álbum
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cacheListSelected.size === 0}
+                        onClick={() => {
+                          setCacheListSelected(new Set());
+                          lastCacheListIndexRef.current = null;
+                        }}
+                        className="px-2 py-1 rounded text-xs text-gray-400 hover:text-white disabled:opacity-40"
+                      >
+                        Limpiar
+                      </button>
+                      <span className="text-[10px] text-gray-500">Shift+clic: rango</span>
+                    </>
+                  )}
+                </div>
+              )}
+            {searchByContent &&
+              cacheStats &&
+              !findingSimilar &&
+              similarTab === "negativas" &&
+              cacheListItems.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-gray-800/80 bg-gray-900/60">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCacheListSelectMode((m) => !m);
+                      if (cacheListSelectMode) {
+                        setCacheListSelected(new Set());
+                        lastCacheListIndexRef.current = null;
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded text-xs font-medium ${
+                      cacheListSelectMode
+                        ? "bg-amber-700 text-white"
+                        : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                    }`}
+                  >
+                    {cacheListSelectMode ? "Salir de selección" : "Seleccionar varias"}
+                  </button>
+                  {cacheListSelectMode && (
+                    <>
+                      <span className="text-xs text-gray-400">
+                        {cacheListSelected.size} elegida{cacheListSelected.size !== 1 ? "s" : ""}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={cacheListSelected.size === 0 || cacheListBatchBusy}
+                        onClick={() => void handleBatchCacheListMark("positive")}
+                        className="px-2.5 py-1 rounded text-xs font-medium bg-green-700 text-white hover:bg-green-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Marcar positivas
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cacheListSelected.size === 0}
+                        onClick={() => {
+                          setCacheListSelected(new Set());
+                          lastCacheListIndexRef.current = null;
+                        }}
+                        className="px-2 py-1 rounded text-xs text-gray-400 hover:text-white disabled:opacity-40"
+                      >
+                        Limpiar
+                      </button>
+                      <span className="text-[10px] text-gray-500">Shift+clic: rango</span>
+                    </>
+                  )}
+                </div>
+              )}
             <div className="p-4 overflow-auto flex-1">
               {findingSimilar ? (
                 <div className="flex flex-col items-center justify-center py-16 text-gray-400">
-                  <Spinner message={`Cargando pool (${similarPoolCount.toLocaleString()} fotos) y buscando...`} />
+                  <Spinner
+                    message={
+                      similarPoolCount > 0
+                        ? `Construyendo pool (${similarPoolCount.toLocaleString()} candidatas)… luego búsqueda (lotes ~1000)`
+                        : "Buscando en biblioteca…"
+                    }
+                  />
                 </div>
               ) : similarTab === "positivas" || similarTab === "negativas" ? (
                 loadingCacheList ? (
@@ -1151,80 +1999,72 @@ export default function AlbumDetail() {
                     {similarTab === "positivas" ? "No hay positivas en cache." : "No hay negativas en cache."}
                   </div>
                 ) : (
-                  <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-2">
-                    {cacheListItems.map((r) => {
+                  <NumberedSimilarGrid
+                    gridCols={similarGridCols}
+                    items={cacheListItems}
+                    keyForItem={(r) => r.file_id}
+                    renderItem={(r, index) => {
                       const f = cacheListFiles[r.file_id];
-                      if (!f) return null;
-                      return (
-                        <div key={r.file_id} className="relative group">
-                          <PhotoCard file={f} onClick={() => setLightbox(f)} />
+                      if (!f) {
+                        return (
                           <div
-                            className="absolute inset-0 flex flex-col items-center justify-center gap-1 opacity-0 group-hover:opacity-100 bg-black/60 rounded-lg transition-opacity pointer-events-none group-hover:pointer-events-auto cursor-pointer"
-                            onClick={() => setLightbox(f)}
-                          >
-                            {similarTab === "positivas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleAddSimilarToAlbum(r.file_id); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-purple-600 hover:bg-purple-500"
-                              >
-                                + Álbum
-                              </button>
-                            )}
-                            {similarTab === "positivas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "negative"); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-amber-700 hover:bg-amber-600"
-                              >
-                                → Negativas
-                              </button>
-                            )}
-                            {similarTab === "negativas" && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleSetCacheStatus(r.file_id, "positive"); }}
-                                className="px-2 py-1 rounded text-white text-xs bg-green-700 hover:bg-green-600"
-                              >
-                                → Positivas
-                              </button>
-                            )}
-                          </div>
-                          <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5">
+                            className="aspect-[4/3] rounded-lg bg-gray-800/40 border border-dashed border-gray-700"
+                            aria-hidden
+                          />
+                        );
+                      }
+                      return (
+                        <div className="relative group">
+                          <PhotoCard
+                            file={f}
+                            selectable={cacheListSelectMode}
+                            selected={cacheListSelected.has(r.file_id)}
+                            onSelect={(e) => toggleCacheListSelect(r.file_id, index, e)}
+                            onClick={cacheListSelectMode ? undefined : () => setLightbox(f)}
+                          />
+                          <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5 pointer-events-none">
                             {Math.round(r.similarity * 100)}%
                           </span>
                         </div>
                       );
-                    })}
-                  </div>
+                    }}
+                  />
                 )
               ) : similarResults.length === 0 ? (
                 <div className="text-center py-16 text-gray-400">
                   {similarPoolCount > 0 ? "No se encontraron fotos similares." : "Sin resultados."}
                 </div>
               ) : (
-                <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-2">
-                  {similarResults.map((r) => {
+                <NumberedSimilarGrid
+                  gridCols={similarGridCols}
+                  items={similarResults}
+                  keyForItem={(r) => r.file_id}
+                  renderItem={(r, index) => {
                     const f = similarFiles[r.file_id];
-                    if (!f) return null;
-                    return (
-                      <div key={r.file_id} className="relative group">
-                        <PhotoCard file={f} onClick={() => setLightbox(f)} />
+                    if (!f) {
+                      return (
                         <div
-                          className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 bg-black/60 rounded-lg transition-opacity pointer-events-none group-hover:pointer-events-auto cursor-pointer"
-                          onClick={() => setLightbox(f)}
-                        >
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleAddSimilarToAlbum(r.file_id); }}
-                            className="px-2 py-1 rounded text-white text-xs bg-purple-600 hover:bg-purple-500"
-                          >
-                            + Álbum
-                          </button>
-                        </div>
-                        <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5">
+                          className="aspect-[4/3] rounded-lg bg-gray-800/40 border border-dashed border-gray-700"
+                          aria-hidden
+                        />
+                      );
+                    }
+                    return (
+                      <div className="relative group">
+                        <PhotoCard
+                          file={f}
+                          selectable={suggestedSelectMode}
+                          selected={suggestedSelected.has(r.file_id)}
+                          onSelect={(e) => toggleSimilarSuggested(r.file_id, index, e)}
+                          onClick={suggestedSelectMode ? undefined : () => setLightbox(f)}
+                        />
+                        <span className="absolute bottom-0 left-0 right-0 text-xs bg-black/70 text-center py-0.5 pointer-events-none">
                           {Math.round(r.similarity * 100)}%
                         </span>
                       </div>
                     );
-                  })}
-                </div>
+                  }}
+                />
               )}
             </div>
           </div>

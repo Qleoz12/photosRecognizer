@@ -354,7 +354,7 @@ def get_memory_photos(memory_id: int, session: Session = Depends(get_session)):
     files = []
     for mf in mfs:
         f = session.get(FileModel, mf.file_id)
-        if f:
+        if f and getattr(f, "archived", 0) == 0:
             files.append(FileOut(
                 id=f.id,
                 path=f.path,
@@ -367,5 +367,6 @@ def get_memory_photos(memory_id: int, session: Session = Depends(get_session)):
                 height=f.height,
                 duration=getattr(f, "duration", None),
                 faces=[],
+                archived=False,
             ))
     return files

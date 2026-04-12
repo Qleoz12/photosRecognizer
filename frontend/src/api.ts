@@ -1,13 +1,130 @@
-const BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+/**
+ * Debe coincidir con el puerto del API (p. ej. `start.bat` usa uvicorn en 8732).
+ * Si `VITE_API_URL` está vacío, `??` no aplica: el fetch iría al origen del Vite y devolvería index.html → "Unexpected token '<'".
+ */
+const DEFAULT_API_BASE = "http://localhost:8732";
+
+function getApiBase(): string {
+  const raw = import.meta.env.VITE_API_URL;
+  if (raw == null || String(raw).trim() === "") {
+    return DEFAULT_API_BASE;
+  }
+  return String(raw).replace(/\/+$/, "");
+}
+
+export const API_BASE = getApiBase();
+const BASE = API_BASE;
+
+/** Mismo valor que PHOTOS_SHARE_CREATE_SECRET en el .env del API si protegés POST /api/share/create. */
+const SHARE_CREATE_SECRET = String(import.meta.env.VITE_PHOTOS_SHARE_CREATE_SECRET ?? "").trim();
+
+/**
+ * Base para API y medios en la vista pública `/share/:token`.
+ * Debe ser el origen de la página (ngrok, localhost:5892, etc.), nunca API_BASE:
+ * en el navegador del invitado `localhost:8732` es su propio PC.
+ */
+export function sharePublicBaseUrl(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.origin;
+}
 const PAGE_SIZE = 100;
 
-async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, options);
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+/** PIN de 7 dígitos (solo en memoria de sesión del navegador tras verificar). */
+const ARCHIVE_PIN_KEY = "photos_archive_pin";
+
+export function getStoredArchivePin(): string | null {
+  try {
+    return sessionStorage.getItem(ARCHIVE_PIN_KEY);
+  } catch {
+    return null;
   }
-  return res.json() as Promise<T>;
+}
+
+export function setStoredArchivePin(pin: string | null): void {
+  try {
+    if (pin) sessionStorage.setItem(ARCHIVE_PIN_KEY, pin);
+    else sessionStorage.removeItem(ARCHIVE_PIN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function apiTimingEnv(): { verbose: boolean; slowMs: number } {
+  const v = import.meta.env.VITE_LOG_API_TIMING;
+  const verbose =
+    import.meta.env.DEV ||
+    v === "true" ||
+    v === "1";
+  const raw = import.meta.env.VITE_SLOW_API_MS;
+  const slowMs = Math.max(0, Number(raw ?? "1000") || 1000);
+  return { verbose, slowMs };
+}
+
+function logApiTiming(
+  method: string,
+  pathLabel: string,
+  t0: number,
+  detail: string,
+  opts?: { error?: boolean }
+): void {
+  const { verbose, slowMs } = apiTimingEnv();
+  const ms = Math.round(performance.now() - t0);
+  if (!verbose && ms < slowMs && !opts?.error) return;
+  const msg = `[API] ${method} ${pathLabel} ${detail} | ${ms}ms`;
+  if (opts?.error || ms >= slowMs * 2) console.warn(msg);
+  else if (ms >= slowMs) console.info(msg);
+  else console.debug(msg);
+}
+
+const API_FETCH_TIMEOUT_MS = Math.max(
+  0,
+  Number(String(import.meta.env.VITE_API_FETCH_TIMEOUT_MS ?? "").trim()) || 300_000,
+);
+
+async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method ?? "GET").toUpperCase();
+  const url = `${BASE}${path}`;
+  const pathLabel = path.length > 120 ? `${path.slice(0, 120)}…` : path;
+  const t0 = performance.now();
+
+  let signal = options?.signal;
+  if (
+    signal == null &&
+    API_FETCH_TIMEOUT_MS > 0 &&
+    typeof AbortSignal !== "undefined" &&
+    typeof AbortSignal.timeout === "function"
+  ) {
+    signal = AbortSignal.timeout(API_FETCH_TIMEOUT_MS);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, { ...options, signal });
+  } catch (e) {
+    logApiTiming(method, pathLabel, t0, "→ fetch failed", { error: true });
+    throw e;
+  }
+
+  const text = await res.text();
+  if (!res.ok) {
+    logApiTiming(method, pathLabel, t0, `→ HTTP ${res.status}`);
+    throw new Error(`API ${res.status}: ${text.slice(0, 400)}`);
+  }
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html")) {
+    logApiTiming(method, pathLabel, t0, "→ HTML not JSON", { error: true });
+    throw new Error(
+      `La API devolvió HTML en lugar de JSON. Revisa VITE_API_URL (debe apuntar al servidor FastAPI, p. ej. ${DEFAULT_API_BASE}). Petición: ${url}`
+    );
+  }
+  try {
+    const data = JSON.parse(text) as T;
+    logApiTiming(method, pathLabel, t0, `→ ${res.status}`);
+    return data;
+  } catch (e) {
+    logApiTiming(method, pathLabel, t0, "→ bad JSON", { error: true });
+    throw new Error(`Respuesta no JSON (${url}): ${String(e)} · ${text.slice(0, 120)}`);
+  }
 }
 
 export interface ClusterOut {
@@ -17,6 +134,7 @@ export interface ClusterOut {
   cover_face_id: number | null;
   cover_thumbnail: string | null;
   is_manual: boolean;
+  is_hidden?: boolean;
 }
 
 export interface ClusterSimilarOut extends ClusterOut {
@@ -45,6 +163,7 @@ export interface FileOut {
   height: number | null;
   duration: number | null;  // seconds, for videos
   faces: FaceOut[];
+  archived?: boolean;
 }
 
 export interface SearchResult {
@@ -58,10 +177,17 @@ export interface SearchResult {
 
 export interface Stats {
   total_files: number;
+  archived_count?: number;
+  /** No archivados, con fecha EXIF */
+  dated_count?: number;
+  /** No archivados, sin fecha EXIF */
+  undated_count?: number;
   total_photos: number;
   total_videos: number;
   total_faces: number;
   unassigned_faces: number;
+  /** Personas (clusters) marcadas como ocultas */
+  hidden_people_count?: number;
 }
 
 export interface MemoryOut {
@@ -80,8 +206,10 @@ export interface AlbumOut {
 }
 
 export const api = {
-  getPeople: (skip = 0, limit = 200) =>
-    apiFetch<ClusterOut[]>(`/people/?skip=${skip}&limit=${limit}`),
+  getPeople: (skip = 0, limit = 200, includeHidden = false) =>
+    apiFetch<ClusterOut[]>(
+      `/people/?skip=${skip}&limit=${limit}&include_hidden=${includeHidden ? "true" : "false"}`,
+    ),
 
   getPerson: (id: number) => apiFetch<ClusterOut>(`/people/${id}`),
 
@@ -98,6 +226,26 @@ export const api = {
   getPersonPhotos: (id: number, skip = 0, limit = PAGE_SIZE) =>
     apiFetch<FileOut[]>(`/people/${id}/photos?skip=${skip}&limit=${limit}`),
 
+  /** ZIP con todas las fotos/vídeos de la persona (GET directo, no JSON). */
+  personDownloadZipUrl: (personId: number) => `${BASE}/people/${personId}/download.zip`,
+
+  createShareCollection: (personIds: number[], ttlHours = 24) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (SHARE_CREATE_SECRET) headers["X-Photos-Share-Secret"] = SHARE_CREATE_SECRET;
+    return apiFetch<{ token: string; expires_at: string; path_prefix: string }>("/api/share/create", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ person_ids: personIds, ttl_hours: ttlHours }),
+    });
+  },
+
+  /** Estado de túneles ngrok vía API local (el backend llama a 127.0.0.1:4040). */
+  getNgrokTunnels: () =>
+    apiFetch<{
+      tunnels?: Array<{ public_url?: string; proto?: string; config?: { addr?: string } }>;
+      _photos_recognizer?: { ok?: boolean; error?: string };
+    }>("/photos/ngrok-tunnels"),
+
   renamePerson: (id: number, label: string) =>
     apiFetch<ClusterOut>(`/people/${id}`, {
       method: "PATCH",
@@ -112,6 +260,16 @@ export const api = {
       body: JSON.stringify({ cover_face_id: faceId }),
     }),
 
+  updatePerson: (
+    id: number,
+    body: { label?: string | null; cover_face_id?: number; is_hidden?: boolean },
+  ) =>
+    apiFetch<ClusterOut>(`/people/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
   faceCropByIdUrl: (faceId: number) => `${BASE}/faces/${faceId}/crop`,
 
   mergePeople: (sourceId: number, targetId: number) =>
@@ -121,13 +279,34 @@ export const api = {
       body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
     }),
 
-  addVideoToPerson: (personId: number, fileId: number) =>
-    apiFetch<ClusterOut>(`/people/${personId}/add-video?file_id=${fileId}`, {
-      method: "POST",
-    }),
+  /** strictFaces: si true, exige rostro ya indexado (error 400 si no hay). Default false = permite placeholder CLIP. */
+  addVideoToPerson: (personId: number, fileId: number, strictFaces = false) =>
+    apiFetch<ClusterOut>(
+      `/people/${personId}/add-video?file_id=${fileId}${strictFaces ? "&strict_faces=true" : ""}`,
+      { method: "POST" },
+    ),
 
-  getPhotos: (skip = 0, limit = 100, fileType?: "photo" | "video") =>
-    apiFetch<FileOut[]>(`/photos/?skip=${skip}&limit=${limit}${fileType ? `&file_type=${fileType}` : ""}`),
+  getPhotos: (
+    skip = 0,
+    limit = 100,
+    fileTypeOrOpts?: "photo" | "video" | { fileType?: "photo" | "video"; hasExifDate?: boolean },
+  ) => {
+    const params = new URLSearchParams();
+    params.set("skip", String(skip));
+    params.set("limit", String(limit));
+    let fileType: "photo" | "video" | undefined;
+    let hasExifDate: boolean | undefined;
+    if (typeof fileTypeOrOpts === "string") {
+      fileType = fileTypeOrOpts;
+    } else if (fileTypeOrOpts && typeof fileTypeOrOpts === "object") {
+      fileType = fileTypeOrOpts.fileType;
+      hasExifDate = fileTypeOrOpts.hasExifDate;
+    }
+    if (fileType) params.set("file_type", fileType);
+    if (hasExifDate === true) params.set("has_exif_date", "true");
+    if (hasExifDate === false) params.set("has_exif_date", "false");
+    return apiFetch<FileOut[]>(`/photos/?${params.toString()}`);
+  },
 
   getVideos: (skip = 0, limit = 100) =>
     apiFetch<FileOut[]>(`/photos/?skip=${skip}&limit=${limit}&file_type=video`),
@@ -152,6 +331,47 @@ export const api = {
     }>(`/photos/${photoId}/date-metadata`),
 
   getStats: () => apiFetch<Stats>("/photos/stats/summary"),
+
+  getPhotoStatsByYear: () =>
+    apiFetch<{ by_year: Array<{ year: string; count: number }> }>("/photos/stats/by-year"),
+
+  batchSetExifYear: (fileIds: number[], year: number) =>
+    apiFetch<{ updated: number }>("/photos/batch/exif-year", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds, year }),
+    }),
+
+  getArchiveStatus: () => apiFetch<{ configured: boolean }>("/photos/archive/status"),
+  verifyArchivePin: (pin: string) =>
+    apiFetch<{ ok: boolean }>("/photos/archive/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin }),
+    }),
+  listArchivedPhotos: (skip = 0, limit = 100, fileType?: "photo" | "video") => {
+    const pin = getStoredArchivePin();
+    if (!pin) throw new Error("PIN no configurado en esta sesión");
+    return apiFetch<FileOut[]>(
+      `/photos/archive/list?skip=${skip}&limit=${limit}${fileType ? `&file_type=${fileType}` : ""}`,
+      { headers: { "X-Archive-Pin": pin } }
+    );
+  },
+  archiveFiles: (fileIds: number[]) =>
+    apiFetch<{ archived: number }>("/photos/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  unarchiveFiles: (fileIds: number[]) => {
+    const pin = getStoredArchivePin();
+    if (!pin) throw new Error("PIN no configurado en esta sesión");
+    return apiFetch<{ restored: number }>("/photos/archive/unarchive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Archive-Pin": pin },
+      body: JSON.stringify({ file_ids: fileIds }),
+    });
+  },
   getFileExtensions: () =>
     apiFetch<{ extension: string; count: number; example_file_id: number; file_type: string }[]>(
       "/photos/file-extensions"
@@ -220,7 +440,7 @@ export const api = {
       body: JSON.stringify({ face_id: faceId, is_canonical: isCanonical }),
     }),
 
-  triggerRecluster: (algorithm = "hdbscan", eps = 0.4) =>
+  triggerRecluster: (algorithm = "hdbscan", eps = 0.6) =>
     apiFetch<{ status: string }>(`/search/recluster?algorithm=${algorithm}&eps=${eps}`, {
       method: "POST",
     }),
@@ -329,7 +549,7 @@ export const api = {
     fileIds: number[],
     minSimilarity = 0.35,
     forceClip = false,
-    maxNew = 1000,
+    maxNew = 500,
     excludeFacesFromCentroid = false
   ) =>
     apiFetch<{
@@ -338,6 +558,9 @@ export const api = {
       sample_file_ids?: number[];
       cached_count: number;
       computed_count: number;
+      pool_size?: number;
+      uncached_remaining_after?: number;
+      total_cached_album?: number;
       results: { file_id: number; similarity: number }[];
     }>(
       `/albums/${albumId}/find-similar?min_similarity=${minSimilarity}`,
@@ -371,9 +594,22 @@ export const api = {
         body: JSON.stringify({ status }),
       }
     ),
+  setCacheManualStatusBatch: (
+    albumId: number,
+    fileIds: number[],
+    status: "positive" | "negative"
+  ) =>
+    apiFetch<{ updated: number; file_ids: number[]; status: string }>(
+      `/albums/${albumId}/search-cache`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_ids: fileIds, status }),
+      }
+    ),
   findSimilarLibrary: (
     albumId: number,
-    maxNew = 1000,
+    maxNew = 500,
     forceClip = true,
     excludeFacesFromCentroid = false
   ) =>
@@ -383,6 +619,9 @@ export const api = {
       sample_file_ids?: number[];
       cached_count: number;
       computed_count: number;
+      pool_size?: number;
+      uncached_remaining_after?: number;
+      total_cached_album?: number;
       results: { file_id: number; similarity: number }[];
     }>(
       `/albums/${albumId}/find-similar-library?min_similarity=0.35&max_new=${maxNew}&force_clip=${forceClip}&exclude_faces_from_centroid=${excludeFacesFromCentroid}`
@@ -402,12 +641,14 @@ export const api = {
 
   /** Solo entre fileIds cargados en la página (p. ej. All Photos). No escanea toda la biblioteca. */
   findSimilarPersonInPage: (personId: number, fileIds: number[], minSimilarity = 0.35) =>
-    apiFetch<{ file_id: number; similarity: number }[]>(
-      `/people/${personId}/find-similar-in-page?min_similarity=${minSimilarity}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file_ids: fileIds }),
-      }
-    ),
+    apiFetch<{
+      results: { file_id: number; similarity: number }[];
+      pool_size: number;
+      skipped_already_in_person: number;
+      skipped_no_faces: number;
+    }>(`/people/${personId}/find-similar-in-page?min_similarity=${minSimilarity}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
 };

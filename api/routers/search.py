@@ -16,13 +16,30 @@ from pydantic import BaseModel
 
 from api.deps import get_session
 from api.models import SearchResult, FaceInRegionOut, FacesFromRegionOut
-from indexer.db import Face, File as FileModel
+from indexer.db import Face, File as FileModel, Cluster
 from indexer.face_detector import detect_faces, load_image
 from indexer.region_embedder import embed_region
-from indexer.embeddings_store import get_all_embeddings
+from indexer.embeddings_store import get_all_embeddings, invalidate_cluster_centroids_cache
 from indexer.hnsw_index import build_index
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+
+def _face_on_archived_file(session: Session, face: Face) -> bool:
+    ff = session.get(FileModel, face.file_id) if face.file_id else None
+    return ff is not None and getattr(ff, "archived", 0) == 1
+
+
+def _skip_match_for_search(session: Session, face: Face) -> bool:
+    if _face_on_archived_file(session, face):
+        return True
+    cid = face.cluster_id
+    if cid is None:
+        return False
+    cl = session.get(Cluster, cid)
+    if cl is None:
+        return False
+    return int(getattr(cl, "is_hidden", 0) or 0) == 1
 
 
 class FaceFromRegionIn(BaseModel):
@@ -74,6 +91,8 @@ async def search_by_face(
     for face_id, sim in matches:
         face = session.get(Face, face_id)
         if face is None:
+            continue
+        if _skip_match_for_search(session, face):
             continue
         results.append(SearchResult(
             cluster_id=face.cluster_id,
@@ -170,6 +189,8 @@ def search_faces_from_region(
         raise HTTPException(404, "File not found")
     if f.file_type != "photo":
         raise HTTPException(400, "Only photos supported")
+    if getattr(f, "archived", 0) == 1:
+        raise HTTPException(404, "File not found")
 
     detected = _crop_and_detect_all(Path(f.path), body.bbox)
     if not detected:
@@ -184,6 +205,8 @@ def search_faces_from_region(
             for face_id, sim in matches:
                 face = session.get(Face, face_id)
                 if face is None:
+                    continue
+                if _skip_match_for_search(session, face):
                     continue
                 suggestions.append(SearchResult(
                     cluster_id=face.cluster_id,
@@ -211,6 +234,8 @@ def search_by_face_region(
         raise HTTPException(404, "File not found")
     if f.file_type != "photo":
         raise HTTPException(400, "Only photos supported")
+    if getattr(f, "archived", 0) == 1:
+        raise HTTPException(404, "File not found")
 
     result = _crop_and_detect(Path(f.path), body.bbox)
     if result is None:
@@ -227,6 +252,8 @@ def search_by_face_region(
         face = session.get(Face, face_id)
         if face is None:
             continue
+        if _skip_match_for_search(session, face):
+            continue
         results.append(SearchResult(
             cluster_id=face.cluster_id,
             face_id=face_id,
@@ -242,7 +269,7 @@ def search_by_face_region(
 def trigger_recluster(
     background_tasks: BackgroundTasks,
     algorithm: str = "hdbscan",
-    eps: float = 0.4,
+    eps: float = 0.6,
     min_samples: int = 2,
 ):
     """Trigger face re-clustering in the background."""
@@ -259,4 +286,5 @@ def invalidate_index():
     """Invalidate the in-memory HNSW index (call after indexing new photos)."""
     global _index_cache
     _index_cache = None
+    invalidate_cluster_centroids_cache()
     return {"status": "index invalidated"}

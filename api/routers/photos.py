@@ -2,19 +2,26 @@
 /photos  — file-centric endpoints
 """
 import json
-from collections import defaultdict
+import logging
+import urllib.error
+import urllib.request
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
+from api.archive_pin import archive_pin_configured, archive_pin_matches
 from api.deps import get_session
-from api.models import FileOut, FaceOut, FileUpdateIn
+from api.models import ArchiveIdsIn, BulkExifYearIn, FileOut, FaceOut, FileUpdateIn, PinVerifyIn
 from indexer.db import File, Face
+from indexer.query_patterns import eager_load_file_faces_metadata
 
 router = APIRouter(prefix="/photos", tags=["photos"])
+log = logging.getLogger("photos_recognizer.api")
 
 
 def _file_to_out(f: File) -> FileOut:
@@ -48,7 +55,20 @@ def _file_to_out(f: File) -> FileOut:
         height=f.height,
         duration=getattr(f, "duration", None),
         faces=faces_out,
+        archived=bool(getattr(f, "archived", 0)),
     )
+
+
+def _file_to_out_safe(f: File) -> Optional[FileOut]:
+    """No tumba toda la página si un archivo tiene bbox_json u otro dato corrupto."""
+    try:
+        return _file_to_out(f)
+    except Exception as e:
+        log.warning("list_photos: omitiendo file_id=%s (%s): %s", f.id, f.path[:80] if f.path else "", e)
+        return None
+
+
+UNDATED_PAGE_MAX = 500  # máx. ítems por petición cuando solo sin EXIF (galería All Photos)
 
 
 @router.get("/", response_model=List[FileOut])
@@ -58,18 +78,39 @@ def list_photos(
     file_type: Optional[str] = Query(None, pattern="^(photo|video)$"),
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    has_exif_date: Optional[bool] = Query(
+        None,
+        description="true=solo con fecha EXIF; false=solo sin fecha (máx. 10 por página); null=todos",
+    ),
     session: Session = Depends(get_session),
 ):
-    q = session.query(File).options(joinedload(File.faces))
+    q = session.query(File).options(eager_load_file_faces_metadata())
     if file_type:
         q = q.filter(File.file_type == file_type)
     if date_from:
         q = q.filter(File.exif_date >= date_from)
     if date_to:
         q = q.filter(File.exif_date <= date_to)
-    q = q.order_by(File.exif_date.desc().nullsfirst(), File.mtime.desc().nullslast())
+    q = q.filter(File.archived == 0)
+
+    if has_exif_date is True:
+        q = q.filter(File.exif_date.isnot(None))
+        q = q.order_by(File.exif_date.desc(), File.mtime.desc().nullslast())
+    elif has_exif_date is False:
+        q = q.filter(File.exif_date.is_(None))
+        q = q.order_by(File.mtime.desc().nullslast(), File.id.desc())
+        limit = min(limit, UNDATED_PAGE_MAX)
+    else:
+        # Sin filtro: fechas reales primero; sin fecha al final del listado paginado
+        q = q.order_by(File.exif_date.desc().nullslast(), File.mtime.desc().nullslast())
+
     files = q.offset(skip).limit(limit).all()
-    return [_file_to_out(f) for f in files]
+    out: List[FileOut] = []
+    for f in files:
+        fo = _file_to_out_safe(f)
+        if fo is not None:
+            out.append(fo)
+    return out
 
 
 @router.get("/file-extensions")
@@ -94,12 +135,194 @@ def get_file_extensions(session: Session = Depends(get_session)):
     ]
 
 
+@router.get("/stats/summary")
+def get_stats(session: Session = Depends(get_session)):
+    row = session.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM files) AS total_files,
+                (SELECT COUNT(*) FROM files WHERE archived = 1) AS archived_count,
+                (SELECT COUNT(*) FROM files WHERE archived = 0 AND exif_date IS NOT NULL) AS dated_count,
+                (SELECT COUNT(*) FROM files WHERE archived = 0 AND exif_date IS NULL) AS undated_count,
+                (SELECT COUNT(*) FROM files WHERE file_type = 'photo') AS total_photos,
+                (SELECT COUNT(*) FROM files WHERE file_type = 'video') AS total_videos,
+                (SELECT COUNT(*) FROM faces) AS total_faces,
+                (SELECT COUNT(*) FROM faces WHERE cluster_id IS NULL) AS unassigned_faces,
+                (SELECT COUNT(*) FROM clusters c WHERE IFNULL(c.is_hidden, 0) = 1 AND EXISTS (
+                    SELECT 1 FROM faces f WHERE f.cluster_id = c.id
+                )) AS hidden_people_count
+            """
+        )
+    ).mappings().one()
+    return dict(row)
+
+
+@router.get("/stats/by-year")
+def stats_by_year(session: Session = Depends(get_session)):
+    """
+    Conteos por año (campo exif_date en BD), no archivados.
+    Se agrega en Python para evitar fallos de strftime según cómo SQLite guarde datetimes.
+    """
+    ctr: Counter[str] = Counter()
+    q = session.query(File.exif_date).filter(File.archived == 0, File.exif_date.isnot(None))
+    for (d,) in q:
+        if d is not None:
+            ctr[str(d.year)] += 1
+    by_year = [{"year": y, "count": n} for y, n in sorted(ctr.items(), key=lambda x: x[0], reverse=True)]
+    return {"by_year": by_year}
+
+
+@router.post("/batch/exif-year")
+def batch_set_exif_year(body: BulkExifYearIn, session: Session = Depends(get_session)):
+    """Asigna la misma fecha EXIF (1 de julio del año dado, mediodía) a muchos archivos no archivados."""
+    if not body.file_ids:
+        return {"updated": 0}
+    if body.year < 1900 or body.year > 2100:
+        raise HTTPException(400, "Año fuera de rango (1900–2100)")
+    target = datetime(body.year, 7, 1, 12, 0, 0)
+    n = 0
+    for fid in body.file_ids:
+        f = session.get(File, fid)
+        if f and getattr(f, "archived", 0) == 0:
+            f.exif_date = target
+            n += 1
+    session.commit()
+    return {"updated": n}
+
+
+def _deny_if_archived_without_pin(f: File, x_archive_pin: Optional[str]) -> None:
+    if getattr(f, "archived", 0) != 1:
+        return
+    if archive_pin_matches(x_archive_pin):
+        return
+    raise HTTPException(404, "Photo not found")
+
+
+@router.get("/archive/status")
+def archive_status():
+    """Indica si el servidor tiene ARCHIVE_PIN configurado (7 u 8 dígitos)."""
+    return {"configured": archive_pin_configured()}
+
+
+@router.post("/archive/verify")
+def verify_archive_pin(body: PinVerifyIn):
+    if not archive_pin_configured():
+        raise HTTPException(503, "Archivo no configurado (falta ARCHIVE_PIN en el servidor)")
+    p = (body.pin or "").strip()
+    if len(p) not in (7, 8) or not p.isdigit():
+        raise HTTPException(400, "PIN debe ser 7 u 8 dígitos numéricos")
+    if not archive_pin_matches(p):
+        raise HTTPException(403, "PIN incorrecto")
+    return {"ok": True}
+
+
+@router.get("/archive/list", response_model=List[FileOut])
+def list_archived_photos(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    file_type: Optional[str] = Query(None, pattern="^(photo|video)$"),
+    session: Session = Depends(get_session),
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
+    if not archive_pin_configured():
+        raise HTTPException(503, "Archivo no configurado (falta ARCHIVE_PIN en el servidor)")
+    if not archive_pin_matches(x_archive_pin):
+        raise HTTPException(401, "PIN requerido o incorrecto (cabecera X-Archive-Pin)")
+
+    q = session.query(File).options(eager_load_file_faces_metadata()).filter(File.archived == 1)
+    if file_type:
+        q = q.filter(File.file_type == file_type)
+    q = q.order_by(File.exif_date.desc().nullsfirst(), File.mtime.desc().nullslast())
+    files = q.offset(skip).limit(limit).all()
+    out: List[FileOut] = []
+    for f in files:
+        fo = _file_to_out_safe(f)
+        if fo is not None:
+            out.append(fo)
+    return out
+
+
+@router.post("/archive")
+def archive_files(body: ArchiveIdsIn, session: Session = Depends(get_session)):
+    if not archive_pin_configured():
+        raise HTTPException(503, "Archivo no configurado (falta ARCHIVE_PIN en el servidor)")
+    if not body.file_ids:
+        return {"archived": 0}
+
+    n = 0
+    with session.no_autoflush:
+        for fid in body.file_ids:
+            f = session.get(File, fid)
+            if f:
+                f.archived = 1
+                n += 1
+    session.commit()
+    return {"archived": n}
+
+
+@router.post("/archive/unarchive")
+def unarchive_files(
+    body: ArchiveIdsIn,
+    session: Session = Depends(get_session),
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
+    if not archive_pin_configured():
+        raise HTTPException(503, "Archivo no configurado (falta ARCHIVE_PIN en el servidor)")
+    if not archive_pin_matches(x_archive_pin):
+        raise HTTPException(401, "PIN requerido o incorrecto (cabecera X-Archive-Pin)")
+    if not body.file_ids:
+        return {"restored": 0}
+
+    n = 0
+    with session.no_autoflush:
+        for fid in body.file_ids:
+            f = session.get(File, fid)
+            if f and getattr(f, "archived", 0) == 1:
+                f.archived = 0
+                n += 1
+    session.commit()
+    return {"restored": n}
+
+
+@router.get("/ngrok-tunnels")
+def ngrok_local_tunnels() -> Dict[str, Any]:
+    """
+    Reenvía la API local de ngrok (127.0.0.1:4040) para que el navegador no choque con CORS.
+    Si ngrok no está en marcha, devuelve tunnels: [].
+    """
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=1.5) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        log.debug("ngrok local API no disponible: %s", e)
+        return {
+            "tunnels": [],
+            "uri": "/api/tunnels",
+            "_photos_recognizer": {"ok": False, "error": str(e)},
+        }
+
+
 @router.get("/{photo_id}", response_model=FileOut)
-def get_photo(photo_id: int, session: Session = Depends(get_session)):
-    f = session.get(File, photo_id)
+def get_photo(
+    photo_id: int,
+    session: Session = Depends(get_session),
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
+    f = (
+        session.query(File)
+        .options(eager_load_file_faces_metadata())
+        .filter(File.id == photo_id)
+        .one_or_none()
+    )
     if not f:
         raise HTTPException(404, "Photo not found")
-    return _file_to_out(f)
+    _deny_if_archived_without_pin(f, x_archive_pin)
+    try:
+        return _file_to_out(f)
+    except Exception as e:
+        log.warning("get_photo: file_id=%s metadata corrupta: %s", photo_id, e)
+        raise HTTPException(500, "Metadatos de archivo corruptos (caras/JSON)") from e
 
 
 @router.patch("/{photo_id}", response_model=FileOut)
@@ -107,20 +330,33 @@ def update_photo(
     photo_id: int,
     body: FileUpdateIn,
     session: Session = Depends(get_session),
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
 ):
     """Update photo metadata (e.g. set date manually when EXIF is missing)."""
     f = session.get(File, photo_id)
     if not f:
         raise HTTPException(404, "Photo not found")
+    _deny_if_archived_without_pin(f, x_archive_pin)
     if body.exif_date is not None:
         f.exif_date = body.exif_date
     session.commit()
-    session.refresh(f)
+    f = (
+        session.query(File)
+        .options(eager_load_file_faces_metadata())
+        .filter(File.id == photo_id)
+        .one_or_none()
+    )
+    if not f:
+        raise HTTPException(404, "Photo not found")
     return _file_to_out(f)
 
 
 @router.get("/{photo_id}/date-metadata")
-def get_photo_date_metadata(photo_id: int, session: Session = Depends(get_session)):
+def get_photo_date_metadata(
+    photo_id: int,
+    session: Session = Depends(get_session),
+    x_archive_pin: Optional[str] = Header(None, alias="X-Archive-Pin"),
+):
     """
     Return all available date metadata for a photo: file system dates + EXIF dates.
     Use "Usar esta fecha" buttons to set the photo date from any of these.
@@ -131,6 +367,7 @@ def get_photo_date_metadata(photo_id: int, session: Session = Depends(get_sessio
     f = session.get(File, photo_id)
     if not f or not Path(f.path).exists():
         raise HTTPException(404, "Photo not found")
+    _deny_if_archived_without_pin(f, x_archive_pin)
 
     result = {
         "file_modified": None,
@@ -160,19 +397,3 @@ def get_photo_date_metadata(photo_id: int, session: Session = Depends(get_sessio
                 result[key_map[k]] = v.isoformat()
 
     return result
-
-
-@router.get("/stats/summary")
-def get_stats(session: Session = Depends(get_session)):
-    total_files = session.query(File).count()
-    total_photos = session.query(File).filter_by(file_type="photo").count()
-    total_videos = session.query(File).filter_by(file_type="video").count()
-    total_faces = session.query(Face).count()
-    unassigned_faces = session.query(Face).filter(Face.cluster_id.is_(None)).count()
-    return {
-        "total_files": total_files,
-        "total_photos": total_photos,
-        "total_videos": total_videos,
-        "total_faces": total_faces,
-        "unassigned_faces": unassigned_faces,
-    }
