@@ -10,7 +10,9 @@ REM    - Cierra Python, mueve wal/shm a respaldo, indexado INCREMENTAL, cluster
 REM
 REM  Subcomandos:
 REM    recreate   Mueve photos.db+wav+shm a data\db_backup\ y reindexa --force
-REM    snapshot   Copia la BD actual a data\db_backup\snapshot_<fecha>\ (cierra API antes)
+REM    snapshot   Copia raw photos.db + WAL + SHM a data\db_backup\snapshot_<fecha>\
+REM    backup-consolidated  Un solo photos.db (fusiona WAL; ideal para copiar a otro disco)
+REM                         Opcional 2º arg: carpeta destino (ej. D:\Respaldos)
 REM    recover    sqlite3 .recover: entrada [salida]
 REM    help       Esta ayuda
 REM
@@ -22,6 +24,8 @@ REM    photos_db.bat recreate
 REM    photos_db.bat recreate 4
 REM    photos_db.bat recreate "D:\Fotos" 4
 REM    photos_db.bat snapshot
+REM    photos_db.bat backup-consolidated
+REM    photos_db.bat backup-consolidated "D:\Respaldos"
 REM    photos_db.bat recover "C:\descargas\vieja.db"
 REM    photos_db.bat recover "mala.db" "data\photos_recovered.db"
 REM ============================================================================
@@ -31,12 +35,15 @@ if /i "%~1"=="/?" goto :help
 if /i "%~1"=="--help" goto :help
 if /i "%~1"=="recreate" goto :recreate
 if /i "%~1"=="snapshot" goto :snapshot
+if /i "%~1"=="backup-consolidated" goto :backup_consolidated
 if /i "%~1"=="recover" goto :recover
 goto :index
 
 :help
 echo.
 echo === photos_db.bat — Base de datos PhotosRecognizer ===
+echo.
+echo En PowerShell, ejecutar con prefijo .\  ejemplo: .\photos_db.bat recover "data\photos.db"
 echo.
 echo [Por defecto] Indexado incremental + agrupar caras (rostros):
 echo   photos_db.bat
@@ -49,10 +56,14 @@ echo   photos_db.bat recreate
 echo   photos_db.bat recreate 4
 echo   photos_db.bat recreate "CARPETA" 4
 echo.
-echo snapshot — Copia de seguridad sin reindexar ^(recomendado: API cerrada^):
+echo snapshot — Copia RAW: photos.db + photos.db-wal + photos.db-shm ^(API cerrada^):
 echo   photos_db.bat snapshot
 echo.
-echo recover — SQLite .recover ^(archivo corrupto pero cabecera SQLite^):
+echo backup-consolidated — Un solo photos.db ^(sin depender del WAL; copiar a otro disco^):
+echo   photos_db.bat backup-consolidated
+echo   photos_db.bat backup-consolidated "D:\Respaldos"
+echo.
+echo recover — SQLite .recover ^(archivo corrupto; CLI SQLite 3.29+^):
 echo   photos_db.bat recover "entrada.db" ["salida.db"]
 echo   Por defecto salida: data\photos_recovered.db
 echo.
@@ -79,7 +90,75 @@ mkdir "%SNAPDIR%" 2>nul
 copy /Y "data\photos.db" "%SNAPDIR%\photos.db" >nul
 if exist "data\photos.db-wal" copy /Y "data\photos.db-wal" "%SNAPDIR%\" >nul
 if exist "data\photos.db-shm" copy /Y "data\photos.db-shm" "%SNAPDIR%\" >nul
+(
+echo PhotosRecognizer — snapshot RAW ^(tres archivos si existian WAL/SHM^)
+echo Carpeta: %SNAPDIR%
+echo Fecha: %TSTAMP%
+echo.
+echo RESTAURAR: deten la app, copia photos.db ^(+ wal/shm si los copiaste^) sobre data\
+echo Si SOLO tienes photos.db y faltan fotos: faltaba el WAL. Usa backup-consolidated.
+echo.
+) > "%SNAPDIR%\LEEME_RESTAURACION.txt"
+(
+echo timestamp=%TSTAMP%
+echo.
+) > "%SNAPDIR%\BACKUP_INFO.txt"
+if exist "data\photos.db" for %%I in ("data\photos.db") do echo photos.db %%~zI bytes>> "%SNAPDIR%\BACKUP_INFO.txt"
+if exist "data\photos.db-wal" for %%I in ("data\photos.db-wal") do echo photos.db-wal %%~zI bytes>> "%SNAPDIR%\BACKUP_INFO.txt"
+if exist "data\photos.db-shm" for %%I in ("data\photos.db-shm") do echo photos.db-shm %%~zI bytes>> "%SNAPDIR%\BACKUP_INFO.txt"
+certutil -hashfile "data\photos.db" SHA256 >> "%SNAPDIR%\BACKUP_INFO.txt" 2>nul
 echo Listo. Copia en: %SNAPDIR%
+pause
+exit /b 0
+
+:backup_consolidated
+for /f %%t in ('python -c "from datetime import datetime; print(datetime.now().strftime('%%Y-%%m-%%d_%%H-%%M-%%S'))"') do set "TSTAMP=%%t"
+set "USERROOT=%~2"
+if "%USERROOT%"=="" (
+    set "OUTROOT=%~dp0data\db_backup\consolidated_%TSTAMP%"
+) else (
+    set "OUTROOT=%~2\consolidated_%TSTAMP%"
+)
+echo.
+echo === BACKUP CONSOLIDADO: un solo photos.db ===
+echo    Destino: %OUTROOT%\
+echo.
+echo Cierra PhotosRecognizer ^(stop.bat^). Sin procesos Python abriendo data\photos.db
+echo.
+pause
+if not exist "data\photos.db" (
+    echo No existe data\photos.db
+    pause
+    exit /b 1
+)
+mkdir "%OUTROOT%" 2>nul
+set "OUTFILE=%OUTROOT%\photos.db"
+python "%~dp0scripts\sqlite_consolidated_backup.py" "%~dp0data\photos.db" "%OUTFILE%"
+if errorlevel 1 (
+    echo [ERROR] backup consolidado fallo. Cierra la app y reintenta.
+    pause
+    exit /b 1
+)
+(
+echo PhotosRecognizer — backup CONSOLIDADO ^(un archivo^)
+echo Origen: %~dp0data\photos.db
+echo Destino: %OUTFILE%
+echo Fecha: %TSTAMP%
+echo.
+echo Este photos.db incluye datos que estaban en el WAL. Puedes copiar SOLO este archivo.
+echo Restaurar: deten la app, sustituye data\photos.db y BORRA data\photos.db-wal y .shm viejos.
+echo.
+) > "%OUTROOT%\LEEME_RESTAURACION.txt"
+(
+echo timestamp=%TSTAMP%
+echo consolidado=1
+echo.
+) > "%OUTROOT%\BACKUP_INFO.txt"
+for %%I in ("data\photos.db") do echo origen_photos.db %%~zI bytes>> "%OUTROOT%\BACKUP_INFO.txt"
+for %%I in ("%OUTFILE%") do echo destino_photos.db %%~zI bytes>> "%OUTROOT%\BACKUP_INFO.txt"
+certutil -hashfile "data\photos.db" SHA256 >> "%OUTROOT%\BACKUP_INFO.txt" 2>nul
+certutil -hashfile "%OUTFILE%" SHA256 >> "%OUTROOT%\BACKUP_INFO.txt" 2>nul
+echo Listo: %OUTFILE%
 pause
 exit /b 0
 
@@ -106,9 +185,18 @@ if exist "%OUTFILE%" (
 if not exist "logs" mkdir "logs"
 for /f %%t in ('python -c "from datetime import datetime; print(datetime.now().strftime('%%Y-%%m-%%d_%%H-%%M-%%S'))"') do set "RTSTAMP=%%t"
 set "ERRLOG=logs\recover_%RTSTAMP%.log"
+where sqlite3 >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] sqlite3 no esta en PATH.
+    echo   Descarga "sqlite-tools-win-*.zip" desde https://www.sqlite.org/download.html
+    echo   y anade la carpeta al PATH, o copia sqlite3.exe junto al proyecto.
+    pause
+    exit /b 1
+)
 echo Entrada: %INFILE%
 echo Salida:  %OUTFILE%
 echo Log err: %ERRLOG%
+REM Orden del CLI SQLite: ".recover" ^(punto obligatorio; SQLite 3.29+^). Si falla, revisa el log indicado arriba.
 sqlite3 "%INFILE%" ".recover" 2>"%ERRLOG%" | sqlite3 "%OUTFILE%"
 if errorlevel 1 (
     echo recover fallo. Revisa %ERRLOG%

@@ -33,7 +33,7 @@ echo In that window you should see two https URLs.
 echo.
 echo Next steps - share links:
 echo   [1] frontend/.env  VITE_API_URL=https://URL-of-photos_api-tunnel
-echo   [2] Restart npm run dev
+echo   [2] Restart pnpm run dev
 echo   [3] API .env  CORS_EXTRA_ORIGINS=https://URL-of-photos_web-tunnel
 echo   [4] Restart start.bat
 echo.

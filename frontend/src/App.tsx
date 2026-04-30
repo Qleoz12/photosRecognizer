@@ -14,6 +14,7 @@ import Videos from "./pages/Videos";
 import FileTypes from "./pages/FileTypes";
 import Archive from "./pages/Archive";
 import ShareCollectionView from "./pages/ShareCollectionView";
+import ThemeSearch from "./pages/ThemeSearch";
 
 /** Consola: cambios de ruta; ms = tiempo desde el cambio de ruta anterior (útil con VITE_LOG_UX=1 en prod). */
 function RouteTimingLogger() {
@@ -51,6 +52,7 @@ function AppShell() {
           <Route path="/person/:id" element={<PersonDetail />} />
           <Route path="/clusters" element={<Clusters />} />
           <Route path="/search" element={<Search />} />
+          <Route path="/theme-search" element={<ThemeSearch />} />
           <Route path="/recuerdos" element={<Recuerdos />} />
           <Route path="/recuerdos/:id" element={<RecuerdoDetail />} />
           <Route path="/albums" element={<Albums />} />

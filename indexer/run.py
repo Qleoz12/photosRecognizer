@@ -24,6 +24,7 @@ from .video_extractor import extract_frames, get_video_metadata
 from .embeddings_store import upsert_file, add_face, delete_faces_for_file, find_by_content_hash, find_by_file_hash, update_file_path
 from .exif_reader import extract_exif
 from .thumbnail import make_thumbnail
+from .perceptual_hash import compute_dhash_hex
 
 DEFAULT_PHOTOS_DIR = Path(__file__).parent.parent / "data" / "photos"
 
@@ -172,6 +173,7 @@ def _process_file(session: Session, fpath: Path, ftype: str):
         exif_date, exif_lat, exif_lon = extract_exif(fpath)
         thumbnail_path = make_thumbnail(image, fpath)
         width, height = image.size
+        phash = compute_dhash_hex(fpath)
 
         file_obj = upsert_file(
             session,
@@ -186,6 +188,7 @@ def _process_file(session: Session, fpath: Path, ftype: str):
             width=width,
             height=height,
             content_hash=content_hash,
+            perceptual_hash=phash,
         )
         delete_faces_for_file(session, file_obj.id)
         for bbox, embedding, score in detect_faces(image):
@@ -236,6 +239,11 @@ def main():
         metavar=("OLD", "NEW"),
         help="Update paths in DB: replace OLD root with NEW (e.g. after moving disk)",
     )
+    parser.add_argument(
+        "--tag-taxonomy",
+        action="store_true",
+        help="Tras indexar (o solo), ejecutar etiquetado CLIP taxonomía → file_tags",
+    )
     args = parser.parse_args()
 
     if args.update_paths:
@@ -257,6 +265,12 @@ def main():
             sys.exit(1)
 
     index_photos(root, force=args.force, workers=args.workers)
+    if args.tag_taxonomy:
+        from indexer.tag_clip_taxonomy import run_tagging
+        from indexer.taxonomy import TAXONOMY_VERSION
+
+        _log("Running CLIP taxonomy tagging...")
+        run_tagging(limit=None, taxonomy_version=TAXONOMY_VERSION)
 
 
 if __name__ == "__main__":

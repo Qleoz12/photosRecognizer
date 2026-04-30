@@ -164,6 +164,7 @@ export interface FileOut {
   duration: number | null;  // seconds, for videos
   faces: FaceOut[];
   archived?: boolean;
+  perceptual_hash?: string | null;
 }
 
 export interface SearchResult {
@@ -377,6 +378,30 @@ export const api = {
       "/photos/file-extensions"
     ),
 
+  getTaxonomyTags: () =>
+    apiFetch<{ id: string; label: string; prompt: string }[]>("/photos/taxonomy/tags"),
+
+  searchPhotosByTag: (
+    tag: string,
+    opts?: { minScore?: number; taxonomyVersion?: number; skip?: number; limit?: number }
+  ) => {
+    const minScore = opts?.minScore ?? 0.22;
+    const tv = opts?.taxonomyVersion ?? 1;
+    const skip = opts?.skip ?? 0;
+    const limit = opts?.limit ?? 50;
+    return apiFetch<FileOut[]>(
+      `/photos/search-by-tag?tag=${encodeURIComponent(tag)}&min_score=${minScore}&taxonomy_version=${tv}&skip=${skip}&limit=${limit}`
+    );
+  },
+
+  searchPhotosByTextClip: (q: string, skip = 0, limit = 40) =>
+    apiFetch<(FileOut & { tag_score: number })[]>(
+      `/photos/search-by-text?q=${encodeURIComponent(q)}&skip=${skip}&limit=${limit}`
+    ),
+
+  getPhotosByPhash: (phash: string) =>
+    apiFetch<FileOut[]>(`/photos/by-phash/${encodeURIComponent(phash)}`),
+
   searchByFace: (file: File, topK = 20) => {
     const form = new FormData();
     form.append("file", file);
@@ -530,8 +555,30 @@ export const api = {
     apiFetch<{ status: string }>(`/albums/${albumId}/files/${fileId}`, {
       method: "DELETE",
     }),
-  getAlbumPhotos: (albumId: number) =>
-    apiFetch<(FileOut & { use_in_centroid?: boolean })[]>(`/albums/${albumId}/photos`),
+  getAlbumPhotos: (albumId: number, skip?: number, limit?: number) => {
+    const params = new URLSearchParams();
+    if (skip != null && skip > 0) params.set("skip", String(skip));
+    if (limit != null) params.set("limit", String(limit));
+    const q = params.toString();
+    return apiFetch<(FileOut & { use_in_centroid?: boolean })[]>(
+      `/albums/${albumId}/photos${q ? `?${q}` : ""}`
+    );
+  },
+  getAlbumPhotosCount: (albumId: number) =>
+    apiFetch<{ count: number }>(`/albums/${albumId}/photos/count`),
+  suggestSimilarAlbums: (fileIds: number[], excludeAlbumId?: number, topK = 8) => {
+    const ids = fileIds.join(",");
+    const ex = excludeAlbumId != null ? `&exclude_album_id=${excludeAlbumId}` : "";
+    return apiFetch<
+      Array<{
+        album_id: number;
+        label: string;
+        similarity: number;
+        file_count: number;
+        cover_thumbnail: string | null;
+      }>
+    >(`/albums/suggestions/similar?file_ids=${encodeURIComponent(ids)}&top_k=${topK}${ex}`);
+  },
   setAlbumFileUseInCentroid: (albumId: number, fileId: number, useInCentroid: boolean) =>
     apiFetch<{ status: string }>(`/albums/${albumId}/files/${fileId}/use-in-centroid`, {
       method: "PATCH",
@@ -624,7 +671,8 @@ export const api = {
       total_cached_album?: number;
       results: { file_id: number; similarity: number }[];
     }>(
-      `/albums/${albumId}/find-similar-library?min_similarity=0.35&max_new=${maxNew}&force_clip=${forceClip}&exclude_faces_from_centroid=${excludeFacesFromCentroid}`
+      `/albums/${albumId}/find-similar-library?min_similarity=0.35&max_new=${maxNew}&force_clip=${forceClip}&exclude_faces_from_centroid=${excludeFacesFromCentroid}`,
+      { method: "POST" }
     ),
   getAlbumSearchCache: (
     albumId: number,

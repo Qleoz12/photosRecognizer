@@ -62,9 +62,11 @@ Abre el navegador en: **http://localhost:5892**
 ```batch
 pip install -r requirements.txt
 cd frontend
-npm install --ignore-scripts
+pnpm install
 cd ..
 ```
+
+(Node 16.13+: `corepack enable` y `corepack prepare pnpm@10.11.0 --activate` si no tenés `pnpm` en PATH.)
 
 ---
 
@@ -88,7 +90,7 @@ Luego:
 ```batch
 pip install -r requirements.txt
 cd frontend
-npm install --ignore-scripts
+pnpm install
 copy .env.example .env
 cd ..
 REM Copiar fotos a data\photos\, luego:

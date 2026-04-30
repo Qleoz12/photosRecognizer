@@ -67,6 +67,7 @@ def upsert_file(
     height: Optional[int] = None,
     duration: Optional[float] = None,
     content_hash: Optional[str] = None,
+    perceptual_hash: Optional[str] = None,
 ) -> File:
     """Insert or update a file record. Returns the File ORM object."""
     existing = session.query(File).filter_by(path=path).first()
@@ -84,6 +85,8 @@ def upsert_file(
             existing.duration = duration
         if content_hash is not None:
             existing.content_hash = content_hash
+        if perceptual_hash is not None:
+            existing.perceptual_hash = perceptual_hash
         session.flush()
         return existing
 
@@ -100,6 +103,7 @@ def upsert_file(
         width=width,
         height=height,
         duration=duration,
+        perceptual_hash=perceptual_hash,
     )
     session.add(file_obj)
     session.flush()

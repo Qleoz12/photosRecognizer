@@ -59,7 +59,7 @@ En un álbum o recuerdo puedes usar **"Buscar similares aquí"** para encontrar 
 ```batch
 pip install -r requirements.txt
 cd frontend
-npm install --ignore-scripts
+pnpm install
 copy .env.example .env
 cd ..
 ```
@@ -87,7 +87,7 @@ cd ..
 
 | Script | Descripción |
 |--------|-------------|
-| `setup.bat` | Primera vez: `pip`, `npm`, carpetas, `.env` del frontend |
+| `setup.bat` | Primera vez: `pip`, `pnpm` (frontend), carpetas, `.env` del frontend |
 | `start.bat` | API (8732) + frontend (5892) |
 | `stop.bat` | Cierra ventanas de la app |
 | `update_paths.bat "OLD" "NEW"` | Sustituye prefijo de rutas en la tabla `files` |

@@ -10,14 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api.archive_pin import archive_pin_configured, archive_pin_matches
 from api.deps import get_session
 from api.models import ArchiveIdsIn, BulkExifYearIn, FileOut, FaceOut, FileUpdateIn, PinVerifyIn
-from indexer.db import File, Face
+from indexer.db import File, Face, FileTag, FileClipEmbedding
 from indexer.query_patterns import eager_load_file_faces_metadata
 
 router = APIRouter(prefix="/photos", tags=["photos"])
@@ -56,6 +57,7 @@ def _file_to_out(f: File) -> FileOut:
         duration=getattr(f, "duration", None),
         faces=faces_out,
         archived=bool(getattr(f, "archived", 0)),
+        perceptual_hash=getattr(f, "perceptual_hash", None),
     )
 
 
@@ -301,6 +303,130 @@ def ngrok_local_tunnels() -> Dict[str, Any]:
             "uri": "/api/tunnels",
             "_photos_recognizer": {"ok": False, "error": str(e)},
         }
+
+
+class TaxonomyTagOut(BaseModel):
+    id: str
+    label: str
+    prompt: str
+
+
+class FileWithTagScoreOut(FileOut):
+    tag_score: float
+
+
+@router.get("/taxonomy/tags", response_model=List[TaxonomyTagOut])
+def list_taxonomy_tags():
+    """Etiquetas fijas disponibles para búsqueda (CLIP taxonomía)."""
+    from indexer.taxonomy import TAXONOMY_TAGS
+
+    return [
+        TaxonomyTagOut(id=t["id"], label=t["id"].replace("_", " "), prompt=t["prompt"])
+        for t in TAXONOMY_TAGS
+    ]
+
+
+@router.get("/search-by-tag", response_model=List[FileOut])
+def search_photos_by_tag(
+    tag: str = Query(..., min_length=1, max_length=64),
+    min_score: float = Query(0.22, ge=0.0, le=1.0),
+    taxonomy_version: int = Query(1, ge=1),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    session: Session = Depends(get_session),
+):
+    """Fotos con la etiqueta dada por encima de min_score (tabla file_tags)."""
+    q = (
+        session.query(File)
+        .join(FileTag, FileTag.file_id == File.id)
+        .options(eager_load_file_faces_metadata())
+        .filter(FileTag.tag_id == tag)
+        .filter(FileTag.taxonomy_version == taxonomy_version)
+        .filter(FileTag.score >= min_score)
+        .filter(File.archived == 0)
+        .filter(File.file_type == "photo")
+        .order_by(FileTag.score.desc(), File.id.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    out: List[FileOut] = []
+    for f in q.all():
+        fo = _file_to_out_safe(f)
+        if fo:
+            out.append(fo)
+    return out
+
+
+@router.get("/search-by-text", response_model=List[FileWithTagScoreOut])
+def search_photos_by_text_clip(
+    q: str = Query(..., min_length=1, max_length=500, description="Texto libre (inglés funciona mejor con CLIP)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(40, ge=1, le=200),
+    session: Session = Depends(get_session),
+):
+    """
+    Ordena fotos con embedding CLIP por similitud coseno con el texto (sin índice ANN: escaneo en bloque).
+    Para bibliotecas muy grandes usar /search-by-tag o precomputar.
+    """
+    import numpy as np
+    from indexer.region_embedder import embed_text_prompts
+    from indexer.db import bytes_to_embedding
+
+    text_emb = embed_text_prompts([q.strip()])
+    if text_emb.shape[0] == 0:
+        return []
+    t = text_emb[0].astype(np.float32)
+    t = t / (np.linalg.norm(t) + 1e-9)
+
+    rows = (
+        session.query(FileClipEmbedding.file_id, FileClipEmbedding.embedding)
+        .join(File, FileClipEmbedding.file_id == File.id)
+        .filter(File.archived == 0)
+        .filter(File.file_type == "photo")
+        .all()
+    )
+    scored: List[tuple[float, int]] = []
+    for fid, blob in rows:
+        e = bytes_to_embedding(blob).astype(np.float32)
+        e = e / (np.linalg.norm(e) + 1e-9)
+        scored.append((float(np.dot(t, e)), fid))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: List[FileWithTagScoreOut] = []
+    for sim, fid in scored[skip : skip + limit]:
+        f = (
+            session.query(File)
+            .options(eager_load_file_faces_metadata())
+            .filter(File.id == fid)
+            .one_or_none()
+        )
+        if not f:
+            continue
+        fo = _file_to_out_safe(f)
+        if fo:
+            out.append(FileWithTagScoreOut(**fo.model_dump(), tag_score=round(sim, 4)))
+    return out
+
+
+@router.get("/by-phash/{phash}", response_model=List[FileOut])
+def list_photos_by_perceptual_hash(
+    phash: str = Path(..., min_length=8, max_length=32),
+    session: Session = Depends(get_session),
+):
+    """Fotos con el mismo hash perceptual (posibles duplicados / misma imagen redimensionada)."""
+    q = (
+        session.query(File)
+        .options(eager_load_file_faces_metadata())
+        .filter(File.perceptual_hash == phash)
+        .filter(File.archived == 0)
+        .filter(File.file_type == "photo")
+        .order_by(File.id.asc())
+    )
+    out: List[FileOut] = []
+    for f in q.limit(200).all():
+        fo = _file_to_out_safe(f)
+        if fo:
+            out.append(fo)
+    return out
 
 
 @router.get("/{photo_id}", response_model=FileOut)

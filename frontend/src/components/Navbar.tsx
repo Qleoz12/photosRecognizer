@@ -10,6 +10,7 @@ export default function Navbar() {
     { to: "/videos", label: "Videos" },
     { to: "/recuerdos", label: "Recuerdos" },
     { to: "/albums", label: "Álbumes" },
+    { to: "/theme-search", label: "Por tema" },
     { to: "/file-types", label: "Tipos de archivo" },
     { to: "/search", label: "Search by Face" },
     { to: "/clusters", label: "Manage Clusters" },

@@ -37,6 +37,7 @@ class FileOut(BaseModel):
     duration: Optional[float] = None  # seconds, for videos
     faces: List[FaceOut] = []
     archived: bool = False
+    perceptual_hash: Optional[str] = None
 
     class Config:
         from_attributes = True

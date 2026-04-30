@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime as dt
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, LargeBinary,
-    ForeignKey, Text, DateTime, event, text
+    ForeignKey, Text, DateTime, event, text, Index
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -34,6 +34,8 @@ class File(Base):
     duration = Column(Float, nullable=True)  # seconds, for videos
     # 1 = archivada (oculta en galería principal; ver / desarchivar con PIN)
     archived = Column(Integer, nullable=False, default=0)
+    # Hash visual 16 hex (dHash 64 bits) para duplicados aproximados; opcional
+    perceptual_hash = Column(String(32), nullable=True, index=True)
 
     faces = relationship("Face", back_populates="file", cascade="all, delete-orphan")
 
@@ -79,6 +81,9 @@ class Album(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     label = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=dt.utcnow, nullable=True)
+    # Centroide CLIP (512 float32) de fotos con use_in_centroid=1; para sugerencias entre álbumes.
+    clip_centroid_embedding = Column(LargeBinary, nullable=True)
+    clip_centroid_updated_at = Column(DateTime, nullable=True)
 
 
 class AlbumFile(Base):
@@ -100,6 +105,21 @@ class FileClipEmbedding(Base):
 
     file_id = Column(Integer, ForeignKey("files.id"), nullable=False, primary_key=True)
     embedding = Column(LargeBinary, nullable=False)  # 512 float32
+    computed_at = Column(DateTime, default=dt.utcnow, nullable=True)
+
+
+class FileTag(Base):
+    """
+    Etiquetas semánticas fijas (taxonomía CLIP): score coseno imagen vs prompt de texto.
+    taxonomy_version permite invalidar y recalcular al cambiar prompts o modelo.
+    """
+    __tablename__ = "file_tags"
+    __table_args__ = (Index("ix_file_tags_tag_version_score", "tag_id", "taxonomy_version", "score"),)
+
+    file_id = Column(Integer, ForeignKey("files.id"), nullable=False, primary_key=True)
+    tag_id = Column(String(64), nullable=False, primary_key=True)
+    taxonomy_version = Column(Integer, nullable=False, primary_key=True)
+    score = Column(Float, nullable=False)
     computed_at = Column(DateTime, default=dt.utcnow, nullable=True)
 
 
@@ -161,7 +181,7 @@ class Face(Base):
 
 
 def _apply_sqlite_schema_and_migrations(engine) -> None:
-    """Crear tablas y migraciones incrementales (solo motor de escritura)."""
+    """Crear tablas y migraciones incrementales (conexión RW)."""
     Base.metadata.create_all(engine)
 
     # Migration: add is_manual column to existing databases
@@ -261,16 +281,61 @@ def _apply_sqlite_schema_and_migrations(engine) -> None:
             conn.execute(text("ALTER TABLE files ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"))
             conn.commit()
 
+    # Migration: albums.clip_centroid (sugerencias entre álbumes)
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(albums)")).fetchall()]
+        if cols and "clip_centroid_embedding" not in cols:
+            conn.execute(text("ALTER TABLE albums ADD COLUMN clip_centroid_embedding BLOB"))
+            conn.execute(text("ALTER TABLE albums ADD COLUMN clip_centroid_updated_at DATETIME"))
+            conn.commit()
+
+    # Migration: files.perceptual_hash (duplicados aprox., opcional)
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.execute(text("PRAGMA table_info(files)")).fetchall()]
+        if cols and "perceptual_hash" not in cols:
+            conn.execute(text("ALTER TABLE files ADD COLUMN perceptual_hash VARCHAR(32)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_files_perceptual_hash ON files (perceptual_hash)"))
+            conn.commit()
+
+
+def _migrate_sqlite_rw(db_path: Path) -> None:
+    """
+    Abre la BD en lectura-escritura solo para DDL/migraciones y cierra.
+    Necesario antes de ?mode=ro: el ORM asume columnas nuevas (p. ej. perceptual_hash).
+    """
+    resolved = db_path.resolve()
+    if not resolved.is_file():
+        return
+    rw = create_engine(
+        f"sqlite:///{resolved.as_posix()}",
+        echo=False,
+        connect_args={"check_same_thread": False, "timeout": 120},
+    )
+
+    @event.listens_for(rw, "connect")
+    def set_wal_migrate(dbapi_conn, _):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.close()
+
+    try:
+        _apply_sqlite_schema_and_migrations(rw)
+    finally:
+        rw.dispose()
+
 
 def get_engine(db_path: Path = DB_PATH, read_only: bool = False):
     """
-    Motor SQLite. Con read_only=True abre la BD en modo solo lectura (URI ?mode=ro), sin migraciones.
-    Usado por workers del API cuando PHOTOS_API_MODE=read.
+    Motor SQLite. Con read_only=True abre ?mode=ro para las consultas, pero antes
+    ejecuta migraciones DDL con una conexión RW breve para alinear esquema y ORM.
     """
     resolved = db_path.resolve()
     if read_only:
         if not resolved.is_file():
             raise FileNotFoundError(f"SQLite DB no encontrada (modo lectura): {resolved}")
+        _migrate_sqlite_rw(resolved)
         uri = resolved.as_uri() + "?mode=ro"
 
         def _connect_ro():

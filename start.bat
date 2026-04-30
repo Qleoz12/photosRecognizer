@@ -24,15 +24,19 @@ REM Archivo (fotos ocultas + /archive): PIN de 7 digitos. Cambia antes de start 
 if "%ARCHIVE_PIN%"=="" set ARCHIVE_PIN=1234567
 echo Archivo: PIN activo ^(cambia ARCHIVE_PIN o .env si quieres otro^)
 
+REM Gateway: 127.0.0.1 evita Errno 13 en algunos Windows al enlazar 0.0.0.0:8732.
+REM Para escuchar en toda la red (LAN), antes de start: set PHOTOS_GATEWAY_HOST=0.0.0.0
+if "%PHOTOS_GATEWAY_HOST%"=="" set PHOTOS_GATEWAY_HOST=127.0.0.1
+
 REM Orden: primero escritura (migraciones), luego lectura, luego gateway.
 REM timeout-keep-alive 300 = peticiones largas (find-similar CLIP ~5 min)
 start "API-write - PhotosRecognizer" cmd /k "cd /d %~dp0 && set PHOTOS_API_MODE=write&& python -m uvicorn api.main:app --host 127.0.0.1 --port 18733 --workers 1 --timeout-keep-alive 300"
 timeout /t 2 /nobreak >nul
 start "API-read - PhotosRecognizer" cmd /k "cd /d %~dp0 && echo [API-read] Uvicorn --workers %API_READ_WORKERS% ^(todos en ESTA ventana; busca %API_READ_WORKERS% x Started server process^) && echo. && set PHOTOS_API_MODE=read&& python -m uvicorn api.main:app --host 127.0.0.1 --port 18734 --workers %API_READ_WORKERS% --timeout-keep-alive 300"
 timeout /t 2 /nobreak >nul
-start "API-gateway - PhotosRecognizer" cmd /k "cd /d %~dp0 && set GATEWAY_SERIALIZE_WRITES=1&& python -m uvicorn api.gateway:app --host 0.0.0.0 --port 8732 --workers 1 --timeout-keep-alive 300"
+start "API-gateway - PhotosRecognizer" cmd /k "cd /d %~dp0 && set GATEWAY_SERIALIZE_WRITES=1&& python -m uvicorn api.gateway:app --host %PHOTOS_GATEWAY_HOST% --port 8732 --workers 1 --timeout-keep-alive 300"
 timeout /t 2 /nobreak >nul
-start "Frontend - PhotosRecognizer" cmd /k "cd frontend && npm run dev -- --port 5892"
+start "Frontend - PhotosRecognizer" cmd /k "cd /d %~dp0 && cd frontend && pnpm run dev -- --port 5892"
 
 echo.
 echo API ^(gateway^): http://localhost:8732

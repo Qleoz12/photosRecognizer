@@ -1,8 +1,16 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { api, AlbumOut, FileOut } from "../api";
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { api, FileOut } from "../api";
 import PhotoCard from "../components/PhotoCard";
 import Spinner from "../components/Spinner";
+import { useInfiniteScroll } from "../hooks/useInfiniteScroll";
+
+const ALBUM_PHOTOS_PAGE = 120;
 
 /** Misma lógica que `grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12` */
 function useAlbumSimilarGridCols(): number {
@@ -20,6 +28,39 @@ function useAlbumSimilarGridCols(): number {
     return () => window.removeEventListener("resize", update);
   }, []);
   return cols;
+}
+
+type AlbumPhoto = FileOut & { use_in_centroid?: boolean };
+
+/**
+ * Construye filas listas para `photos` tras añadir al álbum. Si no hay `FileOut` en memoria
+ * (p. ej. miniatura falló y no se guardó en similarFiles), pide GET /photos/:id.
+ * Sin esto, `{ ...undefined, use_in_centroid: true }` deja objetos sin `path` y rompe PhotoCard.
+ */
+async function resolveFilesForAlbumAppend(
+  fileIds: number[],
+  ...lookups: Record<number, FileOut>[]
+): Promise<AlbumPhoto[]> {
+  const rows: AlbumPhoto[] = [];
+  for (const id of fileIds) {
+    let f: FileOut | undefined;
+    for (const lk of lookups) {
+      const hit = lk[id];
+      if (hit) {
+        f = hit;
+        break;
+      }
+    }
+    if (!f) {
+      try {
+        f = await api.getPhoto(id);
+      } catch {
+        continue;
+      }
+    }
+    rows.push({ ...f, use_in_centroid: true });
+  }
+  return rows;
 }
 
 type NumberedSimilarGridProps<T> = {
@@ -85,12 +126,53 @@ function NumberedSimilarGrid<T>({ gridCols, items, keyForItem, renderItem }: Num
 export default function AlbumDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [album, setAlbum] = useState<AlbumOut | null>(null);
-  const [photos, setPhotos] = useState<AlbumPhoto[]>([]);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
+  const albumId = id ? parseInt(id, 10) : NaN;
+  const [reorderMode, setReorderMode] = useState(false);
+
+  const albumQuery = useQuery({
+    queryKey: ["album", albumId],
+    queryFn: () => api.getAlbum(albumId),
+    enabled: !Number.isNaN(albumId),
+    staleTime: 60_000,
+  });
+
+  const photosInfinite = useInfiniteQuery({
+    queryKey: ["albumPhotos", albumId],
+    queryFn: ({ pageParam }) => api.getAlbumPhotos(albumId, pageParam, ALBUM_PHOTOS_PAGE),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce((acc, p) => acc + p.length, 0);
+      if (lastPage.length < ALBUM_PHOTOS_PAGE) return undefined;
+      return loaded;
+    },
+    enabled: !Number.isNaN(albumId),
+    staleTime: 120_000,
+  });
+
+  const photosFullReorder = useQuery({
+    queryKey: ["albumPhotosFull", albumId],
+    queryFn: () => api.getAlbumPhotos(albumId),
+    enabled: !Number.isNaN(albumId) && reorderMode,
+  });
+
+  const flatPhotos = useMemo(
+    () => photosInfinite.data?.pages.flat() ?? [],
+    [photosInfinite.data?.pages]
+  );
+  const photos: AlbumPhoto[] = reorderMode
+    ? (photosFullReorder.data ?? flatPhotos)
+    : flatPhotos;
+
+  const invalidateAlbumQueries = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ["album", albumId] });
+    void queryClient.invalidateQueries({ queryKey: ["albumPhotos", albumId] });
+    void queryClient.invalidateQueries({ queryKey: ["albumPhotosFull", albumId] });
+    void queryClient.invalidateQueries({ queryKey: ["albumSuggest", albumId] });
+  }, [queryClient, albumId]);
+
   const [lightbox, setLightbox] = useState<FileOut | null>(null);
   const [removing, setRemoving] = useState<number | null>(null);
-  const [reorderMode, setReorderMode] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [savingOrder, setSavingOrder] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -154,29 +236,54 @@ export default function AlbumDetail() {
   const [cacheListBatchBusy, setCacheListBatchBusy] = useState(false);
   const similarGridCols = useAlbumSimilarGridCols();
 
-  const albumId = id ? parseInt(id, 10) : NaN;
+  const album = albumQuery.data ?? null;
 
-  type AlbumPhoto = FileOut & { use_in_centroid?: boolean };
+  const albumScrollRootRef = useRef<HTMLDivElement>(null);
+  const loadMoreSentinelRef = useInfiniteScroll(
+    () => {
+      void photosInfinite.fetchNextPage();
+    },
+    photosInfinite.isFetching,
+    Boolean(photosInfinite.hasNextPage)
+  );
+
+  const suggestIds = useMemo(() => photos.slice(0, 48).map((p) => p.id), [photos]);
+  const suggestQuery = useQuery({
+    queryKey: ["albumSuggest", albumId, suggestIds.join(",")],
+    queryFn: () => api.suggestSimilarAlbums(suggestIds, albumId, 6),
+    enabled: !Number.isNaN(albumId) && suggestIds.length >= 1,
+    staleTime: 60_000,
+  });
+
+  const scrollAlbumToStart = () => {
+    albumScrollRootRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const scrollAlbumToEnd = async () => {
+    try {
+      while (photosInfinite.hasNextPage) {
+        await photosInfinite.fetchNextPage();
+      }
+    } catch {
+      /* ignore */
+    }
+    requestAnimationFrame(() => {
+      const el = albumScrollRootRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    });
+  };
 
   const reload = useCallback(() => {
-    if (isNaN(albumId)) return;
-    setLoading(true);
-    Promise.all([api.getAlbum(albumId), api.getAlbumPhotos(albumId)])
-      .then(([a, p]) => {
-        setAlbum(a);
-        setPhotos(p);
-      })
-      .finally(() => setLoading(false));
-    api.getAlbumSearchCacheStats(albumId).then(setCacheStats).catch(() => setCacheStats(null));
-  }, [albumId]);
+    invalidateAlbumQueries();
+    void albumQuery.refetch();
+  }, [invalidateAlbumQueries, albumQuery]);
 
   const refreshCacheStats = useCallback(() => {
     if (!isNaN(albumId)) api.getAlbumSearchCacheStats(albumId).then(setCacheStats).catch(() => setCacheStats(null));
   }, [albumId]);
 
   useEffect(() => {
-    reload();
-  }, [reload]);
+    refreshCacheStats();
+  }, [albumId, refreshCacheStats, photos.length]);
 
   useEffect(() => {
     if (!similarModalOpen) {
@@ -215,7 +322,7 @@ export default function AlbumDetail() {
         albumId,
         ordered.map((f) => f.id)
       );
-      setPhotos(ordered);
+      invalidateAlbumQueries();
     } catch (e) {
       alert("Error al guardar orden: " + e);
       reload();
@@ -229,13 +336,12 @@ export default function AlbumDetail() {
     setRemoving(fileId);
     try {
       await api.removeFileFromAlbum(albumId, fileId);
-      setPhotos((prev) => prev.filter((f) => f.id !== fileId));
       setSelected((s) => {
         const n = new Set(s);
         n.delete(fileId);
         return n;
       });
-      setAlbum((prev) => (prev ? { ...prev, file_count: prev.file_count - 1 } : null));
+      invalidateAlbumQueries();
     } catch (e) {
       alert("Error: " + e);
     } finally {
@@ -256,10 +362,7 @@ export default function AlbumDetail() {
         return;
       }
     }
-    setPhotos((prev) => prev.filter((f) => !ids.includes(f.id)));
-    setAlbum((prev) =>
-      prev ? { ...prev, file_count: prev.file_count - ids.length } : null
-    );
+    invalidateAlbumQueries();
     setSelected(new Set());
     setSelectionMode(false);
     lastIndexRef.current = null;
@@ -303,7 +406,6 @@ export default function AlbumDetail() {
     const next = [...photos];
     const [removed] = next.splice(dragIndex, 1);
     next.splice(dropIndex, 0, removed);
-    setPhotos(next);
     setDragIndex(null);
     await persistOrder(next);
   };
@@ -314,7 +416,6 @@ export default function AlbumDetail() {
     const next = [...photos];
     const [removed] = next.splice(from, 1);
     next.splice(to, 0, removed);
-    setPhotos(next);
     await persistOrder(next);
   };
 
@@ -322,7 +423,7 @@ export default function AlbumDetail() {
     if (isNaN(albumId) || !album) return;
     try {
       const updated = await api.renameAlbum(albumId, newLabel);
-      setAlbum(updated);
+      queryClient.setQueryData(["album", albumId], updated);
       setEditingName(false);
     } catch (e) {
       alert("Error al renombrar: " + e);
@@ -457,9 +558,7 @@ export default function AlbumDetail() {
     setSettingUseInCentroid(fileId);
     try {
       await api.setAlbumFileUseInCentroid(albumId, fileId, useInCentroid);
-      setPhotos((prev) =>
-        prev.map((p) => (p.id === fileId ? { ...p, use_in_centroid: useInCentroid } : p))
-      );
+      invalidateAlbumQueries();
       refreshCacheStats();
     } catch (e) {
       alert("Error: " + e);
@@ -567,17 +666,14 @@ export default function AlbumDetail() {
     setBatchAddingSuggestedToAlbum(true);
     try {
       await api.addFilesToAlbum(albumId, toAdd);
-      const addedRows: AlbumPhoto[] = [];
-      for (const id of toAdd) {
-        const f = similarFiles[id];
-        if (f) addedRows.push({ ...f, use_in_centroid: true });
-      }
+      const addedRows = await resolveFilesForAlbumAppend(toAdd, similarFiles);
       const done = new Set(toAdd);
       setSimilarResults((prev) => prev.filter((r) => !done.has(r.file_id)));
-      setPhotos((prev) => [...prev, ...addedRows]);
-      setAlbum((prev) =>
-        prev ? { ...prev, file_count: (prev.file_count || 0) + toAdd.length } : null
-      );
+      if (addedRows.length < toAdd.length) {
+        void reload();
+      } else {
+        invalidateAlbumQueries();
+      }
       setSuggestedSelected(new Set());
       lastSuggestedIndexRef.current = null;
       setSuggestedSelectMode(false);
@@ -651,7 +747,13 @@ export default function AlbumDetail() {
   };
 
   const handleBatchAddCacheListToAlbum = async () => {
-    if (isNaN(albumId) || similarTab !== "positivas" || cacheListSelected.size === 0) return;
+    if (isNaN(albumId) || cacheListSelected.size === 0) return;
+    // Lista de positivas en caché: en el modal manda `similarTab`; en el panel plegable manda `currentCacheView`
+    // (antes solo se miraba similarTab → en panel seguía "sugeridas" y el botón no hacía nada).
+    const viewingPositiveCache = similarModalOpen
+      ? similarTab === "positivas"
+      : currentCacheView === "positivas";
+    if (!viewingPositiveCache) return;
     const already = new Set(photos.map((p) => p.id));
     const ids = Array.from(cacheListSelected);
     const toAdd = ids.filter((id) => !already.has(id));
@@ -662,11 +764,7 @@ export default function AlbumDetail() {
     setCacheListBatchBusy(true);
     try {
       await api.addFilesToAlbum(albumId, toAdd);
-      const addedRows: AlbumPhoto[] = [];
-      for (const id of toAdd) {
-        const f = cacheListFiles[id];
-        if (f) addedRows.push({ ...f, use_in_centroid: true });
-      }
+      const addedRows = await resolveFilesForAlbumAppend(toAdd, cacheListFiles);
       const done = new Set(toAdd);
       setCacheListItems((prev) => prev.filter((r) => !done.has(r.file_id)));
       setCacheListFiles((prev) => {
@@ -675,10 +773,11 @@ export default function AlbumDetail() {
         return next;
       });
       setCacheListTotal((t) => Math.max(0, t - toAdd.length));
-      setPhotos((prev) => [...prev, ...addedRows]);
-      setAlbum((prev) =>
-        prev ? { ...prev, file_count: (prev.file_count || 0) + toAdd.length } : null
-      );
+      if (addedRows.length < toAdd.length) {
+        void reload();
+      } else {
+        invalidateAlbumQueries();
+      }
       setCacheListSelected(new Set());
       lastCacheListIndexRef.current = null;
       setCacheListSelectMode(false);
@@ -727,8 +826,7 @@ export default function AlbumDetail() {
     try {
       await api.addFilesToAlbum(albumId, [fileId]);
       setSimilarResults((prev) => prev.filter((r) => r.file_id !== fileId));
-      setPhotos((prev) => [...prev, { ...similarFiles[fileId], use_in_centroid: true }].filter(Boolean) as AlbumPhoto[]);
-      setAlbum((prev) => (prev ? { ...prev, file_count: (prev.file_count || 0) + 1 } : null));
+      invalidateAlbumQueries();
       return true;
     } catch (e) {
       alert("Error: " + e);
@@ -769,7 +867,8 @@ export default function AlbumDetail() {
     return null;
   }, [lightbox, similarModalOpen, similarTab, similarResults, cacheListItems, currentCacheView]);
 
-  if (loading || !album) return <Spinner message="Cargando..." />;
+  if (albumQuery.isLoading || photosInfinite.isLoading || !album)
+    return <Spinner message="Cargando..." />;
 
   return (
     <div className="p-6">
@@ -928,6 +1027,20 @@ export default function AlbumDetail() {
         </button>
         {photos.length > 0 && (
           <>
+            <button
+              type="button"
+              onClick={scrollAlbumToStart}
+              className="px-3 py-2 rounded-lg bg-gray-800 text-gray-200 hover:bg-gray-700 text-sm"
+            >
+              ↑ Inicio
+            </button>
+            <button
+              type="button"
+              onClick={() => void scrollAlbumToEnd()}
+              className="px-3 py-2 rounded-lg bg-gray-800 text-gray-200 hover:bg-gray-700 text-sm"
+            >
+              ↓ Fin
+            </button>
             <button
               type="button"
               onClick={() => setViewByFormat((v) => !v)}
@@ -1263,6 +1376,25 @@ export default function AlbumDetail() {
         </p>
       )}
 
+      {photos.length > 0 && suggestQuery.data && suggestQuery.data.length > 0 && (
+        <div className="mb-4 rounded-lg border border-purple-800/40 bg-purple-950/20 p-3">
+          <p className="text-xs text-purple-200/90 mb-2">Álbumes parecidos (CLIP, según fotos cargadas)</p>
+          <div className="flex flex-wrap gap-2">
+            {suggestQuery.data.map((s) => (
+              <button
+                key={s.album_id}
+                type="button"
+                onClick={() => navigate(`/albums/${s.album_id}`)}
+                className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm text-left border border-gray-700"
+              >
+                <span className="text-white">{s.label}</span>
+                <span className="text-gray-500 text-xs ml-2">{Math.round(s.similarity * 100)}%</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {photos.length === 0 ? (
         <div className="text-center py-24 text-gray-500">
           <p className="text-lg">No hay fotos en este álbum.</p>
@@ -1274,7 +1406,19 @@ export default function AlbumDetail() {
             Ir a All Photos
           </button>
         </div>
-      ) : viewByFormat ? (
+      ) : (
+        <div
+          ref={albumScrollRootRef}
+          className="max-h-[min(80vh,1400px)] overflow-y-auto relative pr-1 rounded-lg border border-gray-800/50"
+        >
+          {photosInfinite.isFetching && !photosInfinite.isLoading && (
+            <div className="sticky top-0 z-30 flex justify-end pointer-events-none">
+              <span className="text-xs bg-gray-800/95 text-amber-100 px-2 py-1 rounded m-2 shadow">
+                Actualizando álbum…
+              </span>
+            </div>
+          )}
+          {viewByFormat ? (
         (() => {
           const byExt = new Map<string, typeof photos>();
           for (const f of photos) {
@@ -1291,8 +1435,8 @@ export default function AlbumDetail() {
                     {ext} <span className="text-gray-500">({byExt.get(ext)!.length})</span>
                   </h3>
                   <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-12 gap-1">
-                    {byExt.get(ext)!.map((f) => (
-                      <div key={f.id} className="relative group rounded-lg">
+                    {byExt.get(ext)!.map((f, fi) => (
+                      <div key={f.id != null ? `e${ext}-id${f.id}` : `e${ext}-i${fi}`} className="relative group rounded-lg">
                         <PhotoCard
                           file={f}
                           onClick={() => setLightbox(f)}
@@ -1380,6 +1524,14 @@ export default function AlbumDetail() {
               )}
             </div>
           ))}
+          <div
+            ref={loadMoreSentinelRef}
+            className="col-span-full min-h-8 flex justify-center items-center text-gray-500 text-xs py-2"
+          >
+            {photosInfinite.isFetching && photosInfinite.hasNextPage ? "Cargando más…" : null}
+          </div>
+        </div>
+      )}
         </div>
       )}
 

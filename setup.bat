@@ -27,12 +27,39 @@ if errorlevel 1 (
 )
 echo.
 
-REM Instalar dependencias frontend
-echo Instalando dependencias del frontend...
+REM Instalar dependencias frontend (solo pnpm; ver frontend/package.json preinstall)
+echo Instalando dependencias del frontend con pnpm...
+REM pnpm hace unlink en node_modules del proyecto; si U: tiene NTFS roto/archivos ilegibles,
+REM hay que borrar esta carpeta ANTES (rd /s /q suele ir mejor que borrar desde el explorador).
+if exist "frontend\node_modules" (
+    echo Borrando carpeta anterior frontend\node_modules...
+    rd /s /q "frontend\node_modules" 2>nul
+    timeout /t 1 /nobreak >nul
+)
+if exist "frontend\node_modules" (
+    echo [ERROR] No se pudo borrar "frontend\node_modules".
+    echo   Cierra Cursor, VS Code, terminales y cualquier proceso que use esa ruta.
+    echo   Si el disco U: esta danado: reinicia el PC, ejecuta "chkdsk U: /f" ^(o copia el repo a C:\^).
+    pause
+    exit /b 1
+)
 cd frontend
-call npm install --ignore-scripts
+where pnpm >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] npm install fallo.
+    echo [ERROR] pnpm no esta en PATH. Con Node 16.13+: corepack enable
+    echo         Luego: corepack prepare pnpm@10.11.0 --activate
+    cd ..
+    pause
+    exit /b 1
+)
+REM Store en disco local (C:) para no depender de U:\.pnpm-store ni de U: si el volumen da errores stat/corrupcion.
+if not defined PHOTOS_PNPM_STORE set "PHOTOS_PNPM_STORE=%LOCALAPPDATA%\pnpm-store-photosrecognizer"
+echo pnpm store-dir: %PHOTOS_PNPM_STORE%
+call pnpm install --store-dir "%PHOTOS_PNPM_STORE%"
+if errorlevel 1 (
+    echo [ERROR] pnpm install fallo.
+    echo   Si el mensaje menciona "unlink" en U:\...\node_modules, el volumen U: o esa carpeta
+    echo   sigue corrupta: borra manualmente frontend\node_modules o mueve el proyecto a C:\.
     cd ..
     pause
     exit /b 1

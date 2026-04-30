@@ -55,7 +55,7 @@ export default function PhotoCard({ file, onClick, highlight, selectable, select
         {thumb && !thumbError ? (
           <img
             src={thumb}
-            alt={file.path}
+            alt={file.path ?? ""}
             className="w-full h-full object-cover group-hover:scale-105 transition-transform"
             loading="lazy"
             onError={() => setThumbError(true)}
@@ -64,7 +64,9 @@ export default function PhotoCard({ file, onClick, highlight, selectable, select
           <div className="w-full h-full flex flex-col items-center justify-center bg-gray-800 border border-amber-900/50 text-amber-600/90 p-2">
             <span className="text-2xl" title="Error al cargar miniatura">{isVideo ? "🎥" : "🖼️"}</span>
             <span className="text-[10px] mt-0.5 text-amber-700/80">Error</span>
-            <span className="text-[10px] truncate max-w-full opacity-75">{file.path.split(/[/\\]/).pop()}</span>
+            <span className="text-[10px] truncate max-w-full opacity-75">
+              {(file.path ?? "").split(/[/\\]/).pop() || `#${file.id ?? "?"}`}
+            </span>
           </div>
         )}
         {/* Selection checkbox */}

@@ -3,8 +3,9 @@
 """
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -28,7 +29,7 @@ from sqlalchemy.orm import Session
 from api.deps import get_session
 from api.models import FileOut
 from indexer.db import Album, AlbumFile, AlbumSearchCache, Face, File as FileModel, FileClipEmbedding
-from indexer.db import bytes_to_embedding
+from indexer.db import bytes_to_embedding, embedding_to_bytes
 from indexer.clip_cache import get_or_compute_file_embedding
 
 router = APIRouter(prefix="/albums", tags=["albums"])
@@ -148,6 +149,8 @@ def _recalculate_album_cache_scores(album_id: int, session: Session) -> None:
     )
     ids_for_centroid = [af.file_id for af in afs]
     if not ids_for_centroid:
+        _update_album_clip_centroid(album_id, session)
+        session.commit()
         return
 
     album_embeddings = []
@@ -159,6 +162,8 @@ def _recalculate_album_cache_scores(album_id: int, session: Session) -> None:
         if emb is not None:
             album_embeddings.append(emb)
     if not album_embeddings:
+        _update_album_clip_centroid(album_id, session)
+        session.commit()
         return
 
     centroid = np.stack(album_embeddings).mean(axis=0).astype(np.float32)
@@ -178,8 +183,43 @@ def _recalculate_album_cache_scores(album_id: int, session: Session) -> None:
             emb = bytes_to_embedding(fe.embedding)
             emb = emb / (np.linalg.norm(emb) + 1e-9)
             row.similarity = float(np.dot(centroid, emb))
+    _update_album_clip_centroid(album_id, session)
     session.commit()
     log.info("[recalculate] album_id=%s: actualizados %s scores desde embeddings", album_id, len(cache_rows))
+
+
+def _update_album_clip_centroid(album_id: int, session: Session) -> None:
+    """Persiste centroide CLIP del álbum (fotos con use_in_centroid) para sugerencias."""
+    afs = (
+        session.query(AlbumFile)
+        .filter_by(album_id=album_id)
+        .order_by(AlbumFile.sort_order.asc(), AlbumFile.file_id.asc())
+        .all()
+    )
+    centroid_afs = [af for af in afs if getattr(af, "use_in_centroid", 1) == 1]
+    embs: List[np.ndarray] = []
+    for af in centroid_afs:
+        f = session.get(FileModel, af.file_id)
+        if not f or f.file_type != "photo" or not Path(f.path).exists():
+            continue
+        fe = session.get(FileClipEmbedding, f.id)
+        if fe is not None:
+            e = bytes_to_embedding(fe.embedding)
+        else:
+            e = get_or_compute_file_embedding(session, f.id, Path(f.path))
+        if e is not None:
+            embs.append(e.astype(np.float32))
+    album = session.get(Album, album_id)
+    if not album:
+        return
+    if not embs:
+        album.clip_centroid_embedding = None
+        album.clip_centroid_updated_at = datetime.now(timezone.utc)
+        return
+    c = np.stack(embs).mean(axis=0).astype(np.float32)
+    c = c / (np.linalg.norm(c) + 1e-9)
+    album.clip_centroid_embedding = embedding_to_bytes(c)
+    album.clip_centroid_updated_at = datetime.now(timezone.utc)
 
 
 def _album_to_out(album: Album, session: Session) -> AlbumOut:
@@ -203,6 +243,73 @@ def list_albums(session: Session = Depends(get_session)):
     """List all albums."""
     albums = session.query(Album).order_by(Album.id.desc()).all()
     return [_album_to_out(a, session) for a in albums]
+
+
+class AlbumSuggestOut(BaseModel):
+    album_id: int
+    label: str
+    similarity: float
+    file_count: int = 0
+    cover_thumbnail: str | None = None
+
+
+@router.get("/suggestions/similar", response_model=List[AlbumSuggestOut])
+def suggest_albums_similar(
+    file_ids: str = Query(..., description="IDs de archivo separados por coma"),
+    exclude_album_id: Optional[int] = Query(None, description="Álbum actual a excluir"),
+    top_k: int = Query(8, ge=1, le=50),
+    session: Session = Depends(get_session),
+):
+    """
+    Álbumes con centroide CLIP más parecido a la media de los embeddings de los file_ids dados.
+    Requiere que los archivos tengan fila en file_clip_embeddings (ej. tras indexar / usar CLIP).
+    """
+    raw = [x.strip() for x in file_ids.split(",") if x.strip()]
+    if not raw:
+        raise HTTPException(400, "file_ids vacío")
+    try:
+        ids = [int(x) for x in raw[:200]]
+    except ValueError:
+        raise HTTPException(400, "file_ids debe ser enteros separados por coma")
+    embs: List[np.ndarray] = []
+    for fid in ids:
+        fe = session.get(FileClipEmbedding, fid)
+        if fe is None:
+            continue
+        e = bytes_to_embedding(fe.embedding).astype(np.float32)
+        e = e / (np.linalg.norm(e) + 1e-9)
+        embs.append(e)
+    if not embs:
+        return []
+    q = np.stack(embs).mean(axis=0).astype(np.float32)
+    q = q / (np.linalg.norm(q) + 1e-9)
+
+    rows = session.query(Album).filter(Album.clip_centroid_embedding.isnot(None)).all()
+    scored: List[tuple[float, Album]] = []
+    for al in rows:
+        if exclude_album_id is not None and al.id == exclude_album_id:
+            continue
+        blob = getattr(al, "clip_centroid_embedding", None)
+        if not blob:
+            continue
+        c = bytes_to_embedding(blob).astype(np.float32)
+        c = c / (np.linalg.norm(c) + 1e-9)
+        sim = float(np.dot(q, c))
+        scored.append((sim, al))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: List[AlbumSuggestOut] = []
+    for sim, al in scored[:top_k]:
+        ao = _album_to_out(al, session)
+        out.append(
+            AlbumSuggestOut(
+                album_id=al.id,
+                label=al.label,
+                similarity=round(sim, 4),
+                file_count=ao.file_count,
+                cover_thumbnail=ao.cover_thumbnail,
+            )
+        )
+    return out
 
 
 @router.post("/", response_model=AlbumOut)
@@ -431,37 +538,70 @@ class AlbumPhotoOut(FileOut):
     use_in_centroid: bool = True
 
 
-@router.get("/{album_id}/photos", response_model=List[AlbumPhotoOut])
-def get_album_photos(album_id: int, session: Session = Depends(get_session)):
-    """Get all photos in an album (con use_in_centroid para modal Configurar fotos)."""
+@router.get("/{album_id}/photos/count")
+def get_album_photos_count(album_id: int, session: Session = Depends(get_session)):
+    """Número de fotos no archivadas en el álbum (sin cargar metadatos de cada una)."""
     a = session.get(Album, album_id)
     if not a:
         raise HTTPException(404, "Album not found")
-    afs = (
+    n = (
+        session.query(AlbumFile)
+        .join(FileModel, AlbumFile.file_id == FileModel.id)
+        .filter(AlbumFile.album_id == album_id)
+        .filter(FileModel.archived == 0)
+        .count()
+    )
+    return {"count": n}
+
+
+@router.get("/{album_id}/photos", response_model=List[AlbumPhotoOut])
+def get_album_photos(
+    album_id: int,
+    session: Session = Depends(get_session),
+    skip: int = Query(0, ge=0),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=2000,
+        description="Si se omite, devuelve todas las fotos (compatibilidad con clientes antiguos).",
+    ),
+):
+    """Fotos del álbum ordenadas; usar skip/limit para colecciones grandes."""
+    a = session.get(Album, album_id)
+    if not a:
+        raise HTTPException(404, "Album not found")
+    q = (
         session.query(AlbumFile)
         .filter_by(album_id=album_id)
         .order_by(AlbumFile.sort_order.asc(), AlbumFile.file_id.asc())
-        .all()
     )
+    if limit is not None:
+        afs = q.offset(skip).limit(limit).all()
+    elif skip > 0:
+        afs = q.offset(skip).all()
+    else:
+        afs = q.all()
     files = []
     for af in afs:
         f = session.get(FileModel, af.file_id)
         if f and getattr(f, "archived", 0) == 0:
-            files.append(AlbumPhotoOut(
-                id=f.id,
-                path=f.path,
-                file_type=f.file_type,
-                exif_date=f.exif_date,
-                exif_lat=f.exif_lat,
-                exif_lon=f.exif_lon,
-                thumbnail_path=f.thumbnail_path,
-                width=f.width,
-                height=f.height,
-                duration=getattr(f, "duration", None),
-                faces=[],
-                archived=False,
-                use_in_centroid=bool(getattr(af, "use_in_centroid", 1)),
-            ))
+            files.append(
+                AlbumPhotoOut(
+                    id=f.id,
+                    path=f.path,
+                    file_type=f.file_type,
+                    exif_date=f.exif_date,
+                    exif_lat=f.exif_lat,
+                    exif_lon=f.exif_lon,
+                    thumbnail_path=f.thumbnail_path,
+                    width=f.width,
+                    height=f.height,
+                    duration=getattr(f, "duration", None),
+                    faces=[],
+                    archived=False,
+                    use_in_centroid=bool(getattr(af, "use_in_centroid", 1)),
+                )
+            )
     return files
 
 

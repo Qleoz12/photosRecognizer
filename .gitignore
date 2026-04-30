@@ -21,6 +21,9 @@ build/
 # Secretos locales (PIN archivo, etc.)
 .env
 
+# pnpm store local (ver frontend/.npmrc)
+.pnpm-store/
+
 # Node / Frontend
 frontend/node_modules/
 frontend/dist/

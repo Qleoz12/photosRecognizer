@@ -30,6 +30,8 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      // Debe coincidir con start.bat (5892); CLI `--port` sigue teniendo prioridad.
+      port: 5892,
       // Ngrok (and similar) send Host: *.ngrok-free.app; Vite 5.4+ blocks unknown hosts by default.
       host: true,
       allowedHosts: true,

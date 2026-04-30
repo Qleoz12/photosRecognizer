@@ -3,13 +3,20 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=9"
+  },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "preinstall": "npx only-allow pnpm",
+    "dev": "pnpm exec vite",
+    "build": "tsc && pnpm exec vite build",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview"
+    "preview": "pnpm exec vite preview"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.100.6",
     "autoprefixer": "^10.4.27",
     "postcss": "^8.5.8",
     "react": "^18.2.0",
